@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Automation",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_ebay_pending_offers.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}

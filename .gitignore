@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs and outputs
+logs/
+output/
+
+# Local config / secrets
+config/config.json
+.env
+
+# Data files
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# OS junk
+.DS_Store
+Thumbs.db
