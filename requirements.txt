@@ -10,7 +10,7 @@ dotenv==0.9.9
 exceptiongroup==1.3.1
 execnet==2.1.2
 fasteners==0.20
--e git+ssh://git@github.com/dominicci13/shared-python-utils.git@cc59a196a271fe5615412bf24359aae4b9e517aa#egg=fc_utils
+-e git+ssh://git@github.com/dominicci13/shared-python-utils.git@84d5b7dce7b9ec047ba3dbe17e467b875324b60e#egg=fc_utils
 filelock==3.29.0
 h11==0.16.0
 idna==3.13
