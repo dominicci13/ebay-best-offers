@@ -1,740 +1,513 @@
 import os
 import time
-import ctypes
 import traceback
 import pandas as pd
 import xlwings as xl
 from rich import print
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from fc_utils import accounts, chrome, database_utils, custom_functions, ebay, outlook
 from selenium.webdriver.support import expected_conditions as EC
+from fc_utils import accounts, chrome, database_utils, custom_functions, ebay, outlook, alert_utils
+from fc_utils.config_utils import get_env
+from fc_utils.schedule_utils import run_on_schedule
+from fc_utils.accounts import EBAY_PROFILES
 from selenium.common.exceptions import (
     TimeoutException, ElementClickInterceptedException, SessionNotCreatedException
 )
 
-###############################################################################################################################################
-#Get the user and working directory
 directory: str = os.getcwd()
-win_user: str = os.getlogin()
 
-# Load environment credentials
 load_dotenv()
 password: str = os.getenv("eBay_pass")
-
 sender_email: str = os.getenv("SENDER_EMAIL", "")
 to_email: list[str] = [e.strip() for e in os.getenv("TO_EMAIL", "").split(",") if e.strip()]
 cc_email: list[str] = [e.strip() for e in os.getenv("CC_EMAIL", "").split(",") if e.strip()]
 table_pending: str = os.getenv("DB_TABLE_PENDING", "PendingOffers")
 table_aged: str = os.getenv("DB_TABLE_AGED", "AgedInventory")
+user_data_dir: str = get_env("CHROME_USER_DATA_DIR", required=True)
+
 for _t in (table_pending, table_aged):
     if not _t.replace("_", "").isalnum():
         raise ValueError(f"Invalid table name: {_t!r}")
 
-#Create list of accounts
-Accounts: list[str] = ["SellerOrg", 
-                        "SellerOrg3", 
-                        "Account4",
-                        "SellerOrg2"]
+ebay_commission: float = float(os.getenv("EBAY_COMMISSION", "0.091"))
+min_discount: float = float(os.getenv("MIN_DISCOUNT", "0.95"))
+max_discount: float = float(os.getenv("MAX_DISCOUNT", "0.9"))
+min_profit_threshold: float = float(os.getenv("MIN_PROFIT", "0.1"))
+brands: list[str] = [b.strip() for b in os.getenv("BRANDS", "").split(",") if b.strip()]
 
-#Specify the path of files to be used
-OffersWbStr: str = f"{directory}/eBay/Pending-Offers.xlsm"
-AgedInventoryPath: str = f"{directory}/eBay/Items/eBay Aged Inventory"
+offers_wb_path: str = f"{directory}/eBay/Pending-Offers.xlsm"
+aged_inv_path: str = f"{directory}/eBay/Items/eBay Aged Inventory"
 
-#Set Chrome User Data Directory
-user_data_dir: str = f"C:/ChromeAutomationProfile"
 
-###############################################################################################################################################
-#Set eBay default values
-eBayCommission: float = float(os.getenv("EBAY_COMMISSION", "0.091"))
-MinDiscount: float = float(os.getenv("MIN_DISCOUNT", "0.95"))
-MaxDiscount: float = float(os.getenv("MAX_DISCOUNT", "0.9"))
-MinProfit: float = float(os.getenv("MIN_PROFIT", "0.1"))
+def last_update(cursor: object, account: str) -> str | None:
+    """Return the most recent date offers were downloaded for the given account.
 
-#Brands list
-Brands: list[str] = [b.strip() for b in os.getenv("BRANDS", "").split(",") if b.strip()]
+    Args:
+        cursor (object): Active pyodbc cursor connected to the eBay database.
+        account (str): eBay account name to check.
 
-###############################################################################################################################################
-def seconds_until_target(TargetTime: str):
-    #Calculate the number of seconds until the target time
-    now = datetime.now()
-    TargetTime = datetime.strptime(TargetTime, "%H:%M:%S").replace(year=now.year, month=now.month, day=now.day)
-
-    if TargetTime < now:
-        TargetTime += timedelta(days=1)
-
-    return (TargetTime - now).total_seconds()
-
-###############################################################################################################################################
-def LastUpdate() -> str:
+    Returns:
+        str | None: The latest date string, or None if no records exist.
     """
-    Confirm if the pending offers have been downloaded today.\n
-    Returns the latest date in the table database for the current account.
-
-    returns:
-        The latest date.
-    """
-    #Get the most recent date from the "Date" column in the database
     cursor.execute(
-        """
-        SELECT MAX(Date) AS MaxDate
-        FROM PendingOffers
-        WHERE Account = ?
-        """,
-        (Account,)
+        "SELECT MAX(Date) AS MaxDate FROM PendingOffers WHERE Account = ?",
+        (account,)
     )
+    return cursor.fetchone()[0]
 
-    max_date = cursor.fetchone()[0]
 
-    return max_date
+def aged_inventory() -> None:
+    """Upload the Aged Inventory Excel file into the database.
 
-###############################################################################################################################################
-def AgedInventory() -> None:
+    Reads the Raw data, Dead, and Slow sheets, concatenates them, clears
+    the aged inventory table, and inserts the combined SKU/Status rows.
     """
-    Automated the process of uploading the Aged Inventory file to the database.
-    """
-    #Create SQL Database connection
     conn = custom_functions.SQLConnection("Reports")
     cursor = conn.cursor()
 
     cursor.execute(f"DELETE FROM {table_aged}")
-    print("[cyan][INFO][/cyan] Table rows deleted successfully.")
+    print("[cyan][INFO][/cyan] Aged inventory table cleared.")
 
     dataframes = []
     for sheet in ["Raw data", "Dead", "Slow"]:
         df = pd.read_excel(
-            f"{AgedInventoryPath}/Aged Inventory.xlsm",
+            f"{aged_inv_path}/Aged Inventory.xlsm",
             sheet_name=sheet,
             skiprows=4
         )
+        dataframes.append(df[["SKU", "Status"]])
 
-        # Select only the SKU and Status columns
-        FilteredRawData = df[["SKU", "Status"]]
-
-        dataframes.append(FilteredRawData)
-
-    MasterDF = pd.concat(dataframes, ignore_index=True)
-
-    #Insert data into the SQL Database
-    database_utils.insert_dataframe(cursor, table_aged, MasterDF, ["SKU", "Status"])
-
-    # Commit the transaction
+    master_df = pd.concat(dataframes, ignore_index=True)
+    database_utils.insert_dataframe(cursor, table_aged, master_df, ["SKU", "Status"])
     conn.commit()
+    print("[cyan][INFO][/cyan] Aged inventory data inserted.")
 
-    print("[cyan][INFO][/cyan] Data inserted successfully.")
 
-###############################################################################################################################################
-def GetPendingOffers() -> None:
-    """
-    Automates the process of retrieving all Pending Offers.
+def get_pending_offers(driver: object, account: str, today: str, conn: object, cursor: object) -> None:
+    """Scrape all pending offers for one account and insert them into the database.
+
+    Paginates through the pending offers list, cleans each scraped row,
+    builds a DataFrame, and inserts it into the pending offers table.
+
+    Args:
+        driver (object): Active SeleniumBase WebDriver instance.
+        account (str): eBay account display name.
+        today (str): Today's date string in YYYY-MM-DD format.
+        conn (object): Active pyodbc connection.
+        cursor (object): Active pyodbc cursor.
     """
     page = 1
     offset = 0
-    Quantity = 1
-    TotalQty = 0
-    while Quantity != TotalQty:
-        #Retrieve how many offers are being shown
+    quantity = 1
+    total_qty = 0
+
+    while quantity != total_qty:
         try:
-            result_range: list[str] = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.item:nth-child(1)"))).text.split(" ")
-
+            result_range: list[str] = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div.item:nth-child(1)"))
+            ).text.split(" ")
         except TimeoutException:
-            result_range: list[str] = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".result-range"))).text.split(" ")
+            result_range = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".result-range"))
+            ).text.split(" ")
 
-        TotalQty = int(result_range[2])
-        Quantity = int(result_range[0].split("-")[1])
+        total_qty = int(result_range[2])
+        quantity = int(result_range[0].split("-")[1])
 
-        #Get the main ID of the table offers
         parent = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".shui-dt")))
         children = parent.find_elements(By.CSS_SELECTOR, "[id]")
-
         for child in children:
-            id: str = child.get_attribute("id").split("@")[0]
+            row_id: str = child.get_attribute("id").split("@")[0]
             break
 
-        #Find table and retrieve its information
-        print(f"[cyan][INFO][/cyan] Retrieving {Quantity} out of {TotalQty} offers from eBay.")
+        print(f"[cyan][INFO][/cyan] Retrieving {quantity} out of {total_qty} offers from eBay.")
         row = 3
-        DataFromEbay = []
+        data_from_ebay = []
         getting_rows = True
         while getting_rows:
             try:
-                DataRow: list[str] = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, fr"#{id}\@gridData-\@grid-table > tbody:nth-child({row})"))).text.split("\n")
-                #print(f"Row {row}:", DataRow, end="\n\n")
+                data_row: list[str] = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, fr"#{row_id}\@gridData-\@grid-table > tbody:nth-child({row})"))
+                ).text.split("\n")
 
-                #Clean data
-                while DataRow[0].startswith(
-                    (
-                        "Offer",
-                        "Highest",
-                        "Respond",
-                        "Out of stock",
-                        "Listing ",
-                        "Restock",
-                        "Link. ",
-                        "View message",
-                        "Send offer",
-                        "Edit",
-                        "Visibility ",
-                        "Boost ",
-                        "Promote "
-                    )
-                ) or DataRow[0].endswith(
-                    (
-                        "received",
-                        " buyer",
-                        " buyers"
-                    )
-                ):
-                    DataRow.pop(0)
+                while data_row[0].startswith((
+                    "Offer", "Highest", "Respond", "Out of stock", "Listing ",
+                    "Restock", "Link. ", "View message", "Send offer", "Edit",
+                    "Visibility ", "Boost ", "Promote "
+                )) or data_row[0].endswith(("received", " buyer", " buyers")):
+                    data_row.pop(0)
 
-                if DataRow[0].startswith("owner."):
-                    del DataRow[:4]
+                if data_row[0].startswith("owner."):
+                    del data_row[:4]
 
-                if DataRow[1].startswith("Buy It Now"):
-                    ItemID = DataRow[1].split(" · ")[-1]
-                    DataRow.pop(1)
-                    DataRow.insert(3, ItemID)
+                if data_row[1].startswith("Buy It Now"):
+                    item_id: str = data_row[1].split(" · ")[-1]
+                    data_row.pop(1)
+                    data_row.insert(3, item_id)
 
-#                if Account == "SellerOrg3":
-#                    ItemID = DataRow[-2]
-#                    DataRow.pop(-2)
-#                    DataRow.insert(3, ItemID)
+                data_row.pop(4)
+                data_row.pop(4)
 
-                DataRow.pop(4)
-                DataRow.pop(4)
+                if data_row[4] == "Research prices":
+                    data_row.pop(4)
 
-                if DataRow[4] == "Research prices":
-                    DataRow.pop(4)
+                if data_row[2].startswith("$"):
+                    price = data_row[2].replace("$", "").replace(",", "")
+                    data_row.pop(2)
+                    data_row.insert(2, price)
 
-                if DataRow[2].startswith("$"):
-                    price = DataRow[2].replace("$", "").replace(",", "")
-                    DataRow.pop(2)
-                    DataRow.insert(2, price)
+                if data_row[3] == "Buy It Now":
+                    data_row.pop(3)
 
-                if DataRow[3] == "Buy It Now":
-                    DataRow.pop(3)
-
-                DataFromEbay.append(DataRow[:4])
-                #print(f"Row {row}:", DataRow, end="\n\n")
+                data_from_ebay.append(data_row[:4])
                 row += 1
 
             except TimeoutException:
                 getting_rows = False
 
-        #Create DataFrame and save it to an Excel file
-        df = pd.DataFrame(
-            DataFromEbay,
-            columns=[
-                "Title",
-                "SKU",
-                "CurrentPrice",
-                "ItemNumber"
-            ]
-        )
-
-        #Insert a column to the beginning of the table with the name of the account
-        df.insert(0, "Account", Account)
-
-        #Insert another column to the beginning of the table with the date
-        df.insert(0, "Date", Today)
-
-        #Convert the columns to the correct data types
+        df = pd.DataFrame(data_from_ebay, columns=["Title", "SKU", "CurrentPrice", "ItemNumber"])
+        df.insert(0, "Account", account)
+        df.insert(0, "Date", today)
         df["CurrentPrice"] = pd.to_numeric(df["CurrentPrice"], errors="coerce").fillna(0)
-#        print(df)
-#        driver.quit()
-#        quit()
-
         df = df.dropna(subset=["SKU"])
         if df.empty:
-            print(f"[yellow][WARNING][/yellow] No valid rows to insert for account [cyan]{Account}[/cyan]. Skipping.")
+            print(f"[yellow][WARNING][/yellow] No valid rows for [cyan]{account}[/cyan]. Skipping.")
             continue
 
-        #Insert dataframe into the table in the SQL Database
         columns = ["Date", "Account", "Title", "SKU", "CurrentPrice", "ItemNumber"]
         database_utils.insert_dataframe(cursor, table_pending, df, columns)
-
-        # Commit the transaction
         conn.commit()
 
-        #Confirm that all items have been downloaded
-        if Quantity != TotalQty:
+        if quantity != total_qty:
             page += 1
             offset += 25
-
-            #Go to next page
             print(f"[cyan][INFO][/cyan] Navigating to page #{page}.")
             driver.get(f"https://www.ebay.com/sh/lst/active?status=PENDING_OFFERS&limit=25&offset={offset}")
             driver.switch_to_window(0)
 
-###############################################################################################################################################
-def AttendPendingOffers() -> None:
-    """
-    Automates the process of attending all pending offers.
+
+def attend_pending_offers(driver: object, offers_sh: object, first_item: int) -> None:
+    """Read one pending offer row, calculate the response, and act on it in the browser.
+
+    Determines whether to accept, counteroffer, or mark as removed based on
+    profit margin calculations using the configured commission and discount rates.
+
+    Args:
+        driver (object): Active SeleniumBase WebDriver instance.
+        offers_sh (object): xlwings sheet for the Pending Offers tab.
+        first_item (int): Row number of the current offer in the workbook.
     """
     try:
-        print("[cyan][INFO][/cyan] Retrieving offers.")
-        CxOffer: float = round(float(WebDriverWait(driver, 15).until(EC.presence_of_element_located((
+        cx_offer: float = round(float(WebDriverWait(driver, 15).until(EC.presence_of_element_located((
             By.CSS_SELECTOR,
             ".ui-component-offer-details > dl:nth-child(1) > div:nth-child(1) > dd:nth-child(2)"
         ))).text.split(" ")[0].replace("$", "").replace(",", "")), 2)
-
     except TimeoutException:
-        CxOffer = 0
+        cx_offer = 0
 
-    #Write the offer to the Excel file
-    OffersSh.range(f"J{FirstItem}").value = CxOffer
+    offers_sh.range(f"J{first_item}").value = cx_offer
 
-    if CxOffer == 0:
+    if cx_offer == 0:
         print("[cyan][INFO][/cyan] Offer not received. Moving to next item.")
         return
 
-    #Get the offer details
-    Brand = OffersSh.range(f"D{FirstItem}").value.split(" ")[0].title() #Get the brand name from the Excel file
-    SiteCost = float(OffersSh.range(f"H{FirstItem}").value) #Get the site cost from the Excel file
-    CurrentPrice = float(OffersSh.range(f"G{FirstItem}").value) #Get the current price from the Excel file
-    CurrentPriceLowered = CurrentPrice - 0.01 #Get the current price lowered by 0.01
-    TotalCost = float(OffersSh.range(f"N{FirstItem}").value) #Get the total cost from the Excel file
-    CurrentPriceMax = CurrentPrice * MinDiscount #Get the price to counteroffer after applying a 5% discount
-    CurrentPriceMin = CurrentPrice * MaxDiscount #Get the price to counteroffer after applying a 10% discount
-    MinCommission = CurrentPriceMin * eBayCommission #Get the 9.1% commission from eBay for the minimum discount
-    MaxCommission = CurrentPriceMax * eBayCommission #Get the 9.1% commission from eBay for the maximum discount
-    CxOfferCommission = CxOffer * eBayCommission #Get the 9.1% commission from eBay from customer's offer
-    CurrPriceCommission = CurrentPriceLowered * eBayCommission #Get the 9.1% commission from eBay from the current price
-    RealCost1 = TotalCost + MinCommission #Get the real cost by adding the total cost and eBay's 9.1% commission from the minimum discount
-    RealCost2 = TotalCost + MaxCommission #Get the real cost by adding the total cost and eBay's 9.1% commission from the maximum discount
-    RealCost3 = TotalCost + CxOfferCommission #Get the real cost by adding the total cost and eBay's 9.1% commission from the customer's offer
-    RealCost4 = TotalCost + CurrPriceCommission #Get the real cost by adding the total cost and eBay's 9.1% commission from the current price
-    MinProfit = CurrentPriceMin - RealCost1 #Get the profit from the minimum discount
-    MaxProfit = CurrentPriceMax - RealCost2 #Get the profit from the maximum discount
-    CxProfit = CxOffer - RealCost3 #Get the profit from the customer's offer
-    CurrentPriceProfit = CurrentPriceLowered - RealCost4 #Get the profit from the current price
-    MinProfitPerc = MinProfit / CurrentPriceMin #Get the profit percentage from the minimum discount
-    MaxProfitPerc = MaxProfit / CurrentPriceMax #Get the profit percentage from the maximum discount
-    CxProfitPerc = CxProfit / CxOffer #Get the profit percentage from the customer's offer
-    CurrentPricePerc = CurrentPriceProfit / CurrentPriceLowered #Get the profit percentage from the current price
+    brand = offers_sh.range(f"D{first_item}").value.split(" ")[0].title()
+    site_cost = float(offers_sh.range(f"H{first_item}").value)
+    current_price = float(offers_sh.range(f"G{first_item}").value)
+    current_price_lowered = current_price - 0.01
+    total_cost = float(offers_sh.range(f"N{first_item}").value)
 
-    #Determine if the offer is accepted or countered
-    if CxOffer == 0 or SiteCost == 0 or SiteCost == 0.01 or Brand in Brands:
-        Action = "Removed By Buyer"
-        OffersSh.range(f"L{FirstItem}").value = [Action, 0]
+    price_min = current_price * max_discount
+    price_max = current_price * min_discount
+    commission_min = price_min * ebay_commission
+    commission_max = price_max * ebay_commission
+    commission_cx = cx_offer * ebay_commission
+    commission_curr = current_price_lowered * ebay_commission
 
-    elif CxProfitPerc >= 0.11:
-        Action = "Accepted"
+    real_cost_min = total_cost + commission_min
+    real_cost_max = total_cost + commission_max
+    real_cost_cx = total_cost + commission_cx
+    real_cost_curr = total_cost + commission_curr
 
-        OffersSh.range(f"L{FirstItem}").value = [Action, 0]
-        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]accepted[/cyan] for ${CxOffer}, with a {round(CxProfitPerc * 100, 2)}% profit/loss.")
+    profit_min = price_min - real_cost_min
+    profit_max = price_max - real_cost_max
+    cx_profit = cx_offer - real_cost_cx
+    curr_profit = current_price_lowered - real_cost_curr
 
-    elif MinProfitPerc >= 0.11 and MaxProfitPerc < 0.11:
-        Counteroffer = round(CurrentPriceMin, 2)
-        Action = "Counteroffer"
+    profit_min_pct = profit_min / price_min
+    profit_max_pct = profit_max / price_max
+    cx_profit_pct = cx_profit / cx_offer
+    curr_profit_pct = curr_profit / current_price_lowered
 
-        OffersSh.range(f"L{FirstItem}").value = [Action, Counteroffer]
-        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]countered[/cyan] for ${Counteroffer}, with a {round(MinProfitPerc * 100, 2)}% profit/loss.")
+    if cx_offer == 0 or site_cost == 0 or site_cost == 0.01 or brand in brands:
+        action = "Removed By Buyer"
+        offers_sh.range(f"L{first_item}").value = [action, 0]
 
-    elif MaxProfitPerc >= 0.11 and CxProfitPerc < 0.11:
-        Counteroffer = round(CurrentPriceMax, 2)
-        Action = "Counteroffer"
+    elif cx_profit_pct >= 0.11:
+        action = "Accepted"
+        offers_sh.range(f"L{first_item}").value = [action, 0]
+        print(f"[cyan][INFO][/cyan] Offer [cyan]accepted[/cyan] at ${cx_offer} ({round(cx_profit_pct * 100, 2)}% profit).")
 
-        OffersSh.range(f"L{FirstItem}").value = [Action, Counteroffer]
-        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]countered[/cyan] for ${Counteroffer}, with a {round(MaxProfitPerc * 100, 2)}% profit/loss.")
+    elif profit_min_pct >= 0.11 and profit_max_pct < 0.11:
+        counteroffer = round(price_min, 2)
+        action = "Counteroffer"
+        offers_sh.range(f"L{first_item}").value = [action, counteroffer]
+        print(f"[cyan][INFO][/cyan] Offer [cyan]countered[/cyan] at ${counteroffer} ({round(profit_min_pct * 100, 2)}% profit).")
+
+    elif profit_max_pct >= 0.11 and cx_profit_pct < 0.11:
+        counteroffer = round(price_max, 2)
+        action = "Counteroffer"
+        offers_sh.range(f"L{first_item}").value = [action, counteroffer]
+        print(f"[cyan][INFO][/cyan] Offer [cyan]countered[/cyan] at ${counteroffer} ({round(profit_max_pct * 100, 2)}% profit).")
 
     else:
-        Counteroffer = round(CurrentPriceLowered, 2)
-        Action = "Counteroffer"
+        counteroffer = round(current_price_lowered, 2)
+        action = "Counteroffer"
+        offers_sh.range(f"L{first_item}").value = [action, counteroffer]
+        print(f"[cyan][INFO][/cyan] Offer [cyan]countered[/cyan] at ${counteroffer} (price lowered by $0.01, {round(curr_profit_pct * 100, 2)}% profit).")
 
-        OffersSh.range(f"L{FirstItem}").value = [Action, Counteroffer]
-        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]countered[/cyan] by lowering our current price by $0.01 to ${Counteroffer}, with a {round(CurrentPricePerc * 100, 2)}% profit/loss.")
+    if action == "Accepted":
+        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"))).click()
+        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"))).click()
 
-    #Work the offer based on the action
-    if Action == "Accepted":
-        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-            By.CSS_SELECTOR,
-            "button.ui-component-button:nth-child(1)"
-        ))).click()
-        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-            By.CSS_SELECTOR,
-            "button.ui-component-button:nth-child(1)"
-        ))).click()
-        
-    elif Action == "Counteroffer":
-        #Build the counter offer message
-        CounterofferMessage = f"""
-        Thanks for your offer! We send our absolute final price of ${Counteroffer}.
+    elif action == "Counteroffer":
+        counteroffer_msg = f"""
+        Thanks for your offer! We send our absolute final price of ${counteroffer}.
 
         This is unbeatable value! You get fast Free Shipping, worry Free Returns, from a trusted seller. We cannot go lower on this item.
 
         Accept our counteroffer now to secure your deal!
         """
 
-        #Click first counteroffer button, input offer number and counteroffer message
-        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-            By.CSS_SELECTOR,
-            "button.ui-component-button:nth-child(2)"
-        ))).click()
+        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(2)"))).click()
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#bestoffer__priceInput"))).send_keys(str(counteroffer))
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#bestoffer__messageTextarea"))).send_keys(counteroffer_msg)
 
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((
-            By.CSS_SELECTOR,
-            "#bestoffer__priceInput"
-        ))).send_keys(str(Counteroffer))
-
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((
-            By.CSS_SELECTOR,
-            "#bestoffer__messageTextarea"
-        ))).send_keys(CounterofferMessage)
-
-        #Review counteroffer
         try:
-            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-                By.CSS_SELECTOR,
-                "button.ui-component-button:nth-child(1)"
-            ))).click()
-
+            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"))).click()
         except TimeoutException:
-            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-                By.XPATH,
-                "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"
-            ))).click()
+            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"))).click()
 
-        #Confirm counteroffer
         try:
-            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-                By.CSS_SELECTOR,
-                "button.ui-component-button:nth-child(1)"
-            ))).click()
-
+            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"))).click()
         except TimeoutException:
             try:
-                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-                    By.XPATH,
-                    "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[3]/button[1]"
-                ))).click()
-
+                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[3]/button[1]"))).click()
             except TimeoutException:
-                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((
-                    By.XPATH,
-                    "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"
-                ))).click()
+                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"))).click()
 
-        #If error message pops up, then skip the item and write 0 in Excel
         try:
-            AlertStatus: str = WebDriverWait(driver, 15).until(EC.presence_of_element_located((
-                By.XPATH,
-                "/html/body/div[5]/div[4]/div[2]/div/div[2]/div/div/div/div[2]/div/div[2]"
+            alert_status: str = WebDriverWait(driver, 15).until(EC.presence_of_element_located((
+                By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div/div/div/div[2]/div/div[2]"
             ))).text
-            
-            print(f"[bold red][ERROR][/bold red] [cyan]{AlertStatus}[/cyan]. Moving to next item.")
-            OffersSh.range(f"J{FirstItem}").value = 0
-
+            print(f"[bold red][ERROR][/bold red] [cyan]{alert_status}[/cyan]. Moving to next item.")
+            offers_sh.range(f"J{first_item}").value = 0
         except TimeoutException:
             pass
 
     else:
-        print(f"[cyan][INFO][/cyan] Item [cyan]{Action}[/cyan]. Moving to next item.")
+        print(f"[cyan][INFO][/cyan] Item [cyan]{action}[/cyan]. Moving to next item.")
 
-###############################################################################################################################################
-#Ask the user if they want to start the process now
-BtnPressed = ctypes.windll.user32.MessageBoxW(
-    0,
-    "Do you want to start the process now?",
-    "eBay Pending Offers",
-    4 | 0x20
-)
 
-while True:
-    #Time to start
-    StartTime = "17:30:00"
-    StartHour = int(StartTime.split(":")[0])
-    StartMin = StartTime.split(":")[1]
-    nowHour = int(datetime.now().strftime("%H"))
-    tomorrow: str = custom_functions.tomorrow()
-    SleepTime = seconds_until_target(StartTime)
+def main() -> None:
+    """Download pending offers for each eBay account, process them, and email the summary.
 
-    #If the user pressed "Yes", then start the process
-    if BtnPressed == 7:
-        if nowHour >= StartHour:
-            if StartHour > 12:
-                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended tomorrow {tomorrow} at {StartHour - 12}:{StartMin} PM.")
+    Uploads aged inventory if updated today, downloads new pending offers per
+    account, refreshes the workbook, attends each pending offer (accept or
+    counteroffer), saves the workbook, and emails the results summary.
+    """
+    driver = None
+    try:
+        today: str = datetime.now().strftime("%Y-%m-%d")
+        date_str: str = datetime.now().strftime("%m/%d/%Y")
+
+        info = custom_functions.files_info(aged_inv_path)
+        for file in info:
+            file_date = str(file["Date Modified"]).split(" ")[0]
+
+        if file_date == today:
+            print("[cyan][INFO][/cyan] Uploading [cyan]Aged Inventory[/cyan] items to database.")
+            aged_inventory()
+
+        conn = custom_functions.SQLConnection("eBay")
+        cursor = conn.cursor()
+
+        # Download pending offers for each account
+        for account, profile in EBAY_PROFILES.items():
+            if last_update(cursor, account) == today:
+                print(f"[cyan][INFO][/cyan] Offers already retrieved today for [cyan]{account}[/cyan]. Skipping.")
+                continue
+
+            driver = chrome.start_browser(user_data_dir, profile, headless=True)
+
+            driver.get("https://www.ebay.com/sh/ovw")
+            driver.switch_to_window(0)
+
+            try:
+                accounts.ebay(password=password, driver=driver)
+            except TimeoutException:
+                pass
+
+            print(f"[cyan][INFO][/cyan] Navigating to pending offers for [cyan]{account}[/cyan].")
+            driver.get("https://www.ebay.com/sh/lst/active?status=PENDING_OFFERS&limit=25")
+            driver.switch_to_window(0)
+
+            try:
+                WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.fake-link:nth-child(3)"))).click()
+            except (TimeoutException, ElementClickInterceptedException):
+                pass
+
+            ebay.customize_offers_table(driver)
+
+            try:
+                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".zeroResultsMessage")))
+                print(f"[cyan][INFO][/cyan] No pending offers for [cyan]{account}[/cyan].")
+            except TimeoutException:
+                get_pending_offers(driver, account, today, conn, cursor)
+
+            driver.quit()
+
+        # Open workbook, refresh, and sort
+        print("[cyan][INFO][/cyan] Opening [cyan]Pending Offers[/cyan] workbook.")
+        offers_wb = xl.Book(offers_wb_path)
+        offers_sh = offers_wb.sheets("Pending Offers")
+        custom_functions.update_directory(offers_wb)
+
+        refresh_all = offers_wb.macro("Module1.RefreshAll")
+        sort_all = offers_wb.macro("Module1.SortAll")
+        reorganize = offers_wb.macro("Module1.Reorganize")
+
+        print("[cyan][INFO][/cyan] Refreshing all queries.")
+        refresh_all()
+        time.sleep(5)
+        offers_wb.save()
+
+        sort_all()
+        time.sleep(5)
+
+        # Attend pending offers for each account
+        for account, profile in EBAY_PROFILES.items():
+            first_item: int = custom_functions.first_empty_row(offers_sh, "J", "B11")
+            last_item: int = int(offers_sh.range(f"B{offers_sh.cells.last_cell.row}").end("up").row)
+
+            if first_item > last_item:
+                print("[cyan][INFO][/cyan] No new pending offers.")
+                raw_data = None
+            elif first_item == last_item:
+                raw_data = [offers_sh.range(f"C{first_item}:F{last_item}").value]
             else:
-                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended tomorrow {tomorrow} at {StartHour}:{StartMin} AM.")
-        else:
-            if StartHour > 12:
-                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended today at {StartHour - 12}:{StartMin} PM.")
-            else:
-                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended today at {StartHour}:{StartMin} AM.")
+                raw_data = offers_sh.range(f"C{first_item}:F{last_item}").value
 
-        #Sleep until just before the Start time
-        time.sleep(max(SleepTime - 1, 0))
+            if raw_data is None:
+                continue
 
-        #Loop to ensure that we catch the exact time
-        while datetime.now().strftime("%H:%M:%S") != StartTime:
-            time.sleep(0.5)
+            curr_account = raw_data[0][0]
+            if curr_account != account:
+                continue
 
-    #Get today's date on two formats
-    Today: str = datetime.now().strftime("%Y-%m-%d")
-    Date: str = datetime.now().strftime("%m/%d/%Y")
+            driver = chrome.start_browser(user_data_dir, profile, headless=True)
 
-    #Reset the value of the button
-    BtnPressed = 7
+            print(f"[cyan][INFO][/cyan] Navigating to [cyan]{account}[/cyan] profile on eBay.")
+            driver.get("https://www.ebay.com/")
+            time.sleep(2)
+            driver.switch_to_window(0)
 
-    ##################################################################################################################################################
-    #Check the date of the last time the "Aged Inventory" Excel file was updated
-    info = custom_functions.files_info(AgedInventoryPath)
-
-    for file in info:
-        file_date = str(file["Date Modified"]).split(" ")[0]
-
-    #If it was updated today, then upload the file to the database
-    if file_date == Today:
-        print("[cyan][INFO][/cyan] Uploading [cyan]Aged Inventory[/cyan] items to database.")
-        AgedInventory()
-
-    #Create SQL Database connection
-    conn = custom_functions.SQLConnection("eBay")
-    cursor = conn.cursor()
-
-    ###############################################################################################################################################
-    getting_offers = True
-    while getting_offers:
-        try:
-            ###############################################################################################################################################
-            for Account in Accounts:
-                #Set the Google Chrome user folder name
-                if Account == "SellerOrg":
-                    profile = "Default"
-                elif Account == "SellerOrg2":
-                    profile = "Profile 1"
-                elif Account == "SellerOrg3":
-                    profile = "Profile 4"
-                elif Account == "Account4":
-                    profile = "Profile 5"
-
-                #Confirm if pending offers have been already downloaded today
-                if LastUpdate() == Today:
-                    print(f"[cyan][INFO][/cyan] All pending offers have been retrieved today from [cyan]{Account}[/cyan] account. Moving to next account.")
-
-                else:
-                    ###############################################################################################################################################
-                    #Initialize Chrome
-                    opening_browser = True
-                    while opening_browser:
-                        try:
-                            driver: object = chrome.start_browser(
-                                user_data_dir,
-                                profile,
-                                headless=True
-                            )
-                            opening_browser = False
-                        except (SessionNotCreatedException, RuntimeError):
-                            print("[bold red][ERROR][/bold red] Failed to open the Chrome. It seems Chrome was already open. Killing the application and retrying.")
-                            custom_functions.kill_app("chrome")
-
-                    #Navigate to eBay's overview webpage to load cookies
-                    driver.get("https://www.ebay.com/sh/ovw")
-                    driver.switch_to_window(0)
-
-                    #If not logged in, then login
-                    try:
-                        accounts.eBay(
-                            password=password,
-                            driver=driver
-                        )
-
-                    except TimeoutException:
-                        pass
-
-                    print(f"[cyan][INFO][/cyan] Navigating to [cyan]{Account}[/cyan] profile on eBay.")
-                    driver.get("https://www.ebay.com/sh/lst/active?status=PENDING_OFFERS&limit=25")
-                    driver.switch_to_window(0)
-
-                    #If banner to send offers appears, close it 
-                    try:
-                        WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.fake-link:nth-child(3)"))).click()
-                    except (TimeoutException, ElementClickInterceptedException):
-                        pass
-
-                    #Select the desired columns
-                    ebay.customize_offers_table(driver)
-
-                    #Confirm if there are any pending offers
-                    try:
-                        WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".zeroResultsMessage")))
-                        print(f"[cyan][INFO][/cyan] No pending offers for [cyan]{Account}[/cyan] account.")
-                    except TimeoutException:
-                        #Retrieve and save pending offers
-                        GetPendingOffers()
-
-                    #Close browser
+            for item in raw_data:
+                if item[0] != account:
+                    print(f"[cyan][INFO][/cyan] {account} offers done. Moving to [cyan]{item[0]}[/cyan].")
                     driver.quit()
+                    break
 
-            ###############################################################################################################################################
-            #Open Pending Offers Workbook
-            print("[cyan][INFO][/cyan] Opening [cyan]Pending Offers[/cyan] workbook.")
-            OffersWb = xl.Book(OffersWbStr)
-            OffersSh = OffersWb.sheets("Pending Offers")
-            custom_functions.update_directory(OffersWb)
+                print(f"[cyan][INFO][/cyan] Navigating to item {item[3]}.")
+                driver.get(f"https://www.ebay.com/bo/seller/showOffers?itemid={item[3]}")
+                driver.switch_to_window(0)
 
-            #Load Macros
-            RefreshAll = OffersWb.macro("Module1.RefreshAll")
-            SortAll = OffersWb.macro("Module1.SortAll")
-            Reorganize = OffersWb.macro("Module1.Reorganize")
+                attend_pending_offers(driver, offers_sh, first_item)
+                first_item += 1
 
-            print("[cyan][INFO][/cyan] Refreshing all queries.")
-            RefreshAll()
-            time.sleep(5)
-            OffersWb.save()
+        # Build email summary from workbook cells
+        current_hour = datetime.now().hour
+        if 5 <= current_hour <= 11:
+            greeting = "Good morning"
+        elif 12 <= current_hour <= 17:
+            greeting = "Good afternoon"
+        else:
+            greeting = "Good evening"
 
-            #Sort table to get the missing offers at the bottom
-            SortAll()
-            time.sleep(5)
+        fc_accepted = int(offers_sh.range("C4").value)
+        fc_counter = int(offers_sh.range("C5").value)
+        fc_expired = int(offers_sh.range("C6").value)
+        fc_declined = int(offers_sh.range("C7").value)
+        fc_removed = int(offers_sh.range("C8").value)
+        fc_total = int(offers_sh.range("C9").value)
+        ls_accepted = int(offers_sh.range("E4").value)
+        ls_counter = int(offers_sh.range("E5").value)
+        ls_expired = int(offers_sh.range("E6").value)
+        ls_declined = int(offers_sh.range("E7").value)
+        ls_removed = int(offers_sh.range("E8").value)
+        ls_total = int(offers_sh.range("E9").value)
 
-            for Account in Accounts:
-                #Find the first and last empty row in the table
-                FirstItem: int = custom_functions.first_empty_row(OffersSh, "J", "B11")
-                LastItem = int(OffersSh.range(f"B{OffersSh.cells.last_cell.row}").end("up").row)
-
-                if FirstItem > LastItem:
-                    print("[cyan][INFO][/cyan] No new Pending Offers. Exiting.")
-                    RawData = None
-
-                elif FirstItem == LastItem:
-                    RawData = []
-                    RawData.append(OffersSh.range(f"C{FirstItem}:F{LastItem}").value)
-
-                else:
-                    RawData = OffersSh.range(f"C{FirstItem}:F{LastItem}").value
-
-                if RawData is not None:
-                    CurrAccount = RawData[0][0]
-
-                    if CurrAccount != Account:
-                        continue
-
-                    #Set the Google Chrome user folder name
-                    if Account == "SellerOrg":
-                        profile = "Default"
-                    elif Account == "SellerOrg2":
-                        profile = "Profile 1"
-                    elif Account == "SellerOrg3":
-                        profile = "Profile 4"
-                    elif Account == "Account4":
-                        profile = "Profile 5"
-
-                    ###############################################################################################################################################
-                    #Initialize Chrome
-                    opening_browser = True
-                    while opening_browser:
-                        try:
-                            driver: object = chrome.start_browser(user_data_dir, profile, headless=True)
-                            opening_browser = False
-                        except SessionNotCreatedException:
-                            print("[bold red][ERROR][/bold red] Failed to open the Chrome. It seems Chrome was already open. Killing the application and retrying.")
-                            custom_functions.kill_app("chrome")
-
-                    print(f"[cyan][INFO][/cyan] Navigating to [cyan]{Account}[/cyan] profile on eBay.")
-                    driver.get("https://www.ebay.com/")
-                    time.sleep(2)
-                    driver.switch_to_window(0)
-
-                    for item in RawData:
-                        if item[0] != Account:
-                            print(f"[cyan][INFO][/cyan] {Account} pending offers are completed. Moving to [cyan]{item[0]}[/cyan].")
-                            driver.quit()
-                            break
-
-                        print(f"[cyan][INFO][/cyan] Navigating to item {item[3]}.")
-                        driver.get(f"https://www.ebay.com/bo/seller/showOffers?itemid={item[3]}")
-                        driver.switch_to_window(0)
-
-                        #Attend pending offers
-                        AttendPendingOffers()
-                        
-                        FirstItem += 1
-
-            getting_offers = False
-
-        except Exception:
-            driver.save_screenshot("Error.png")
-            print(f"[bold red][ERROR][/bold red] An error occurred. A screenshot of the error has been saved to the current working directory.\n\nError:")
-            traceback.print_exc()
-
-        finally:
-            custom_functions.kill_app("chrome")
-
-    ##################################################################################################################################################
-    #Gather data from the Pending Offers workbook to create the email body
-    FCAccepted = int(OffersSh.range("C4").value)
-    FCCounter = int(OffersSh.range("C5").value)
-    FCExpired = int(OffersSh.range("C6").value)
-    FCDeclined = int(OffersSh.range("C7").value)
-    FCRemoved = int(OffersSh.range("C8").value)
-    FCTotalOff = int(OffersSh.range("C9").value)
-    LSAccepted = int(OffersSh.range("E4").value)
-    LSCounter = int(OffersSh.range("E5").value)
-    LSExpired = int(OffersSh.range("E6").value)
-    LSDeclined = int(OffersSh.range("E7").value)
-    LSRemoved = int(OffersSh.range("E8").value)
-    LSTotalOff = int(OffersSh.range("E9").value)
-
-    #Get current hour
-    current_hour = datetime.now().strftime("%H")
-
-    #Create the greeting based on the current hour
-    if 5 <= int(current_hour) <= 11:
-        greeting = "Good morning"
-    elif 12 <= int(current_hour) <= 17:
-        greeting = "Good afternoon"
-    else:
-        greeting = "Good evening"
-
-    #Create the body of the email
-    body = f"""{greeting},
+        body = f"""{greeting},
         <p>I hope you are doing well.</p>
         <p>Please find attached the eBay best offers cleared today for all accounts.</p>
         <p>Also, please find below a summary:</p>
         <ul>
         <p><b><u>SellerOrg</u></b></p>
-        <li><b>Accepted: </b> {FCAccepted}</li>
-        <li><b>Counteroffer: </b> {FCCounter}</li>
-        <li><b>Declined: </b> {FCDeclined}</li>
-        <li><b>Removed by Buyer: </b> {FCRemoved}</li>
-        <li><b>Expired: </b> {FCExpired}</li>
-        <li><b>Total: </b> {FCTotalOff}</li>
+        <li><b>Accepted: </b> {fc_accepted}</li>
+        <li><b>Counteroffer: </b> {fc_counter}</li>
+        <li><b>Declined: </b> {fc_declined}</li>
+        <li><b>Removed by Buyer: </b> {fc_removed}</li>
+        <li><b>Expired: </b> {fc_expired}</li>
+        <li><b>Total: </b> {fc_total}</li>
         </ul>
         <ul>
         <p><b><u>SellerOrg2</u></b></p>
-        <li><b>Accepted: </b> {LSAccepted}</li>
-        <li><b>Counteroffer: </b> {LSCounter}</li>
-        <li><b>Declined: </b> {LSDeclined}</li>
-        <li><b>Removed by Buyer: </b> {LSRemoved}</li>
-        <li><b>Expired: </b> {LSExpired}</li>
-        <li><b>Total: </b> {LSTotalOff}</li>
+        <li><b>Accepted: </b> {ls_accepted}</li>
+        <li><b>Counteroffer: </b> {ls_counter}</li>
+        <li><b>Declined: </b> {ls_declined}</li>
+        <li><b>Removed by Buyer: </b> {ls_removed}</li>
+        <li><b>Expired: </b> {ls_expired}</li>
+        <li><b>Total: </b> {ls_total}</li>
         </ul>
         <p>Thank you.</p>
         Sincerely,
         """
 
-    ##################################################################################################################################################
-    #Reorganize the table, save and close the workbook
-    print("[cyan][INFO][/cyan] Saving and closing workbook.")
-    Reorganize()
-    OffersWb.save()
-    time.sleep(2)
-    OffersWb.close()
+        print("[cyan][INFO][/cyan] Saving and closing workbook.")
+        reorganize()
+        offers_wb.save()
+        time.sleep(2)
+        offers_wb.close()
 
-    #Send email notification
-    outlook.send_email(
-        account=sender_email,
-        subject=f"eBay Report - Best Offers - {Date}",
-        body=body,
-        to=to_email,
-        cc=cc_email,
-        attachments=[OffersWbStr],
-        show=True,
-        send=True,
-    )
-    print("[cyan][INFO][/cyan] Email notification sent.")
+        outlook.send_email(
+            account=sender_email,
+            subject=f"eBay Report - Best Offers - {date_str}",
+            body=body,
+            to=to_email,
+            cc=cc_email,
+            attachments=[offers_wb_path],
+            show=True,
+            send=True,
+        )
+        print("[cyan][INFO][/cyan] Email sent.")
 
-    #Sleep 60 seconds before starting over
-    time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        print("[yellow][WARNING][/yellow] Script interrupted by user.")
+        raise SystemExit(0)
+
+    except Exception:
+        alert_utils.handle_crash(driver, traceback.format_exc(), "eBay Pending Offers")
+        raise SystemExit(1)
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        custom_functions.kill_app("chrome")
+
+
+run_on_schedule(main, hour=17, minute=30, day_of_week="mon-sun")
