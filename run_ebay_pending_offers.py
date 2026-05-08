@@ -246,6 +246,11 @@ def GetPendingOffers() -> None:
 #        driver.quit()
 #        quit()
 
+        df = df.dropna(subset=["SKU"])
+        if df.empty:
+            print(f"[yellow][WARNING][/yellow] No valid rows to insert for account [cyan]{Account}[/cyan]. Skipping.")
+            continue
+
         #Insert dataframe into the table in the SQL Database
         columns = ["Date", "Account", "Title", "SKU", "CurrentPrice", "ItemNumber"]
         database_utils.insert_dataframe(cursor, table_pending, df, columns)
