@@ -1,6 +1,5 @@
 import os
 import time
-import pyodbc
 import ctypes
 import traceback
 import pandas as pd
@@ -10,7 +9,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from fc_utils import accounts, chrome, custom_functions, ebay, outlook
+from fc_utils import accounts, chrome, database_utils, custom_functions, ebay, outlook
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException, ElementClickInterceptedException, SessionNotCreatedException
@@ -24,6 +23,12 @@ win_user: str = os.getlogin()
 # Load environment credentials
 load_dotenv()
 password: str = os.getenv("eBay_pass")
+
+sender_email: str = os.getenv("SENDER_EMAIL", "")
+to_email: list[str] = [e.strip() for e in os.getenv("TO_EMAIL", "").split(",") if e.strip()]
+cc_email: list[str] = [e.strip() for e in os.getenv("CC_EMAIL", "").split(",") if e.strip()]
+table_pending: str = os.getenv("DB_TABLE_PENDING", "PendingOffers")
+table_aged: str = os.getenv("DB_TABLE_AGED", "AgedInventory")
 
 #Create list of accounts
 Accounts: list[str] = ["SellerOrg", 
@@ -40,19 +45,13 @@ user_data_dir: str = f"C:/ChromeAutomationProfile"
 
 ###############################################################################################################################################
 #Set eBay default values
-eBayCommission: float = 0.091
-MinDiscount: float = 0.95
-MaxDiscount: float = 0.9
-MinProfit: float = 0.1
+eBayCommission: float = float(os.getenv("EBAY_COMMISSION", "0.091"))
+MinDiscount: float = float(os.getenv("MIN_DISCOUNT", "0.95"))
+MaxDiscount: float = float(os.getenv("MAX_DISCOUNT", "0.9"))
+MinProfit: float = float(os.getenv("MIN_PROFIT", "0.1"))
 
 #Brands list
-Brands = [
-    "Vortex",
-    "Celestron",
-    "Swarovski",
-    "Kowa",
-    "ATN"
-]
+Brands: list[str] = [b.strip() for b in os.getenv("BRANDS", "").split(",") if b.strip()]
 
 ###############################################################################################################################################
 def seconds_until_target(TargetTime: str):
@@ -76,11 +75,12 @@ def LastUpdate() -> str:
     """
     #Get the most recent date from the "Date" column in the database
     cursor.execute(
-        f"""
+        """
         SELECT MAX(Date) AS MaxDate
         FROM PendingOffers
-        WHERE Account = '{Account}';
+        WHERE Account = ?
         """,
+        (Account,)
     )
 
     max_date = cursor.fetchone()[0]
@@ -96,8 +96,8 @@ def AgedInventory() -> None:
     conn = custom_functions.SQLConnection("Reports")
     cursor = conn.cursor()
 
-    cursor.execute(f"""DELETE FROM AgedInventory""")
-    print("'[INFO]' Table rows deleted successfully.")
+    cursor.execute(f"DELETE FROM {table_aged}")
+    print("[cyan][INFO][/cyan] Table rows deleted successfully.")
 
     dataframes = []
     for sheet in ["Raw data", "Dead", "Slow"]:
@@ -115,25 +115,12 @@ def AgedInventory() -> None:
     MasterDF = pd.concat(dataframes, ignore_index=True)
 
     #Insert data into the SQL Database
-    for index, row in MasterDF.iterrows():
-        try:
-            cursor.execute(
-                f"""
-                INSERT INTO AgedInventory (SKU, Status)
-                VALUES (?, ?)
-                """,
-                row["SKU"],
-                row["Status"]
-            )
-        except pyodbc.Error:
-            print(f"'[pyodbc.Error]' Error inserting row #{index + 1}:")
-            traceback.print_exc()
-            quit()
+    database_utils.insert_dataframe(cursor, table_aged, MasterDF, ["SKU", "Status"])
 
     # Commit the transaction
     conn.commit()
 
-    print("'[INFO]' Data inserted successfully.")
+    print("[cyan][INFO][/cyan] Data inserted successfully.")
 
 ###############################################################################################################################################
 def GetPendingOffers() -> None:
@@ -164,7 +151,7 @@ def GetPendingOffers() -> None:
             break
 
         #Find table and retrieve its information
-        print(f"'[INFO]' Retrieving {Quantity} out of {TotalQty} offers from eBay.")
+        print(f"[cyan][INFO][/cyan] Retrieving {Quantity} out of {TotalQty} offers from eBay.")
         row = 3
         DataFromEbay = []
         getting_rows = True
@@ -257,19 +244,8 @@ def GetPendingOffers() -> None:
 #        quit()
 
         #Insert dataframe into the table in the SQL Database
-        for index, row in df.iterrows():
-            cursor.execute(
-                f"""
-                INSERT INTO PendingOffers (Date, Account, Title, SKU, CurrentPrice, ItemNumber)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                row["Date"],
-                row["Account"],
-                row["Title"],
-                row["SKU"],
-                row["CurrentPrice"],
-                row["ItemNumber"]
-            )
+        columns = ["Date", "Account", "Title", "SKU", "CurrentPrice", "ItemNumber"]
+        database_utils.insert_dataframe(cursor, table_pending, df, columns)
 
         # Commit the transaction
         conn.commit()
@@ -280,7 +256,7 @@ def GetPendingOffers() -> None:
             offset += 25
 
             #Go to next page
-            print(f"'[INFO]' Navigating to page #{page}.")
+            print(f"[cyan][INFO][/cyan] Navigating to page #{page}.")
             driver.get(f"https://www.ebay.com/sh/lst/active?status=PENDING_OFFERS&limit=25&offset={offset}")
             driver.switch_to_window(0)
 
@@ -290,7 +266,7 @@ def AttendPendingOffers() -> None:
     Automates the process of attending all pending offers.
     """
     try:
-        print("'[INFO]' Retrieving offers.")
+        print("[cyan][INFO][/cyan] Retrieving offers.")
         CxOffer: float = round(float(WebDriverWait(driver, 15).until(EC.presence_of_element_located((
             By.CSS_SELECTOR,
             ".ui-component-offer-details > dl:nth-child(1) > div:nth-child(1) > dd:nth-child(2)"
@@ -303,7 +279,7 @@ def AttendPendingOffers() -> None:
     OffersSh.range(f"J{FirstItem}").value = CxOffer
 
     if CxOffer == 0:
-        print("'[INFO]' Offer not received. Moving to next item.")
+        print("[cyan][INFO][/cyan] Offer not received. Moving to next item.")
         return
 
     #Get the offer details
@@ -340,28 +316,28 @@ def AttendPendingOffers() -> None:
         Action = "Accepted"
 
         OffersSh.range(f"L{FirstItem}").value = [Action, 0]
-        print(f"'[INFO]' Customer's offer 'accepted' for ${CxOffer}, with a {round(CxProfitPerc * 100, 2)}% profit/loss.")
+        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]accepted[/cyan] for ${CxOffer}, with a {round(CxProfitPerc * 100, 2)}% profit/loss.")
 
     elif MinProfitPerc >= 0.11 and MaxProfitPerc < 0.11:
         Counteroffer = round(CurrentPriceMin, 2)
         Action = "Counteroffer"
 
         OffersSh.range(f"L{FirstItem}").value = [Action, Counteroffer]
-        print(f"'[INFO]' Customer's offer 'countered' for ${Counteroffer}, with a {round(MinProfitPerc * 100, 2)}% profit/loss.")
+        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]countered[/cyan] for ${Counteroffer}, with a {round(MinProfitPerc * 100, 2)}% profit/loss.")
 
     elif MaxProfitPerc >= 0.11 and CxProfitPerc < 0.11:
         Counteroffer = round(CurrentPriceMax, 2)
         Action = "Counteroffer"
 
         OffersSh.range(f"L{FirstItem}").value = [Action, Counteroffer]
-        print(f"'[INFO]' Customer's offer 'countered' for ${Counteroffer}, with a {round(MaxProfitPerc * 100, 2)}% profit/loss.")
+        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]countered[/cyan] for ${Counteroffer}, with a {round(MaxProfitPerc * 100, 2)}% profit/loss.")
 
     else:
         Counteroffer = round(CurrentPriceLowered, 2)
         Action = "Counteroffer"
 
         OffersSh.range(f"L{FirstItem}").value = [Action, Counteroffer]
-        print(f"'[INFO]' Customer's offer 'countered' by lowering our current price by $0.01 to ${Counteroffer}, with a {round(CurrentPricePerc * 100, 2)}% profit/loss.")
+        print(f"[cyan][INFO][/cyan] Customer's offer [cyan]countered[/cyan] by lowering our current price by $0.01 to ${Counteroffer}, with a {round(CurrentPricePerc * 100, 2)}% profit/loss.")
 
     #Work the offer based on the action
     if Action == "Accepted":
@@ -440,14 +416,14 @@ def AttendPendingOffers() -> None:
                 "/html/body/div[5]/div[4]/div[2]/div/div[2]/div/div/div/div[2]/div/div[2]"
             ))).text
             
-            print(f"'[ERROR]' '{AlertStatus}'. Moving to next item.")
+            print(f"[bold red][ERROR][/bold red] [cyan]{AlertStatus}[/cyan]. Moving to next item.")
             OffersSh.range(f"J{FirstItem}").value = 0
 
         except TimeoutException:
             pass
 
     else:
-        print(f"'[INFO]' Item '{Action}'. Moving to next item.")
+        print(f"[cyan][INFO][/cyan] Item [cyan]{Action}[/cyan]. Moving to next item.")
 
 ###############################################################################################################################################
 #Ask the user if they want to start the process now
@@ -471,14 +447,14 @@ while True:
     if BtnPressed == 7:
         if nowHour >= StartHour:
             if StartHour > 12:
-                print(f"'[INFO]' eBay Pending Offers will be attended tomorrow {tomorrow} at {StartHour - 12}:{StartMin} PM.")
+                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended tomorrow {tomorrow} at {StartHour - 12}:{StartMin} PM.")
             else:
-                print(f"'[INFO]' eBay Pending Offers will be attended tomorrow {tomorrow} at {StartHour}:{StartMin} AM.")
+                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended tomorrow {tomorrow} at {StartHour}:{StartMin} AM.")
         else:
             if StartHour > 12:
-                print(f"'[INFO]' eBay Pending Offers will be attended today at {StartHour - 12}:{StartMin} PM.")
+                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended today at {StartHour - 12}:{StartMin} PM.")
             else:
-                print(f"'[INFO]' eBay Pending Offers will be attended today at {StartHour}:{StartMin} AM.")
+                print(f"[cyan][INFO][/cyan] eBay Pending Offers will be attended today at {StartHour}:{StartMin} AM.")
 
         #Sleep until just before the Start time
         time.sleep(max(SleepTime - 1, 0))
@@ -503,7 +479,7 @@ while True:
 
     #If it was updated today, then upload the file to the database
     if file_date == Today:
-        print("'[INFO]' Uploading 'Aged Inventory' items to database.")
+        print("[cyan][INFO][/cyan] Uploading [cyan]Aged Inventory[/cyan] items to database.")
         AgedInventory()
 
     #Create SQL Database connection
@@ -528,7 +504,7 @@ while True:
 
                 #Confirm if pending offers have been already downloaded today
                 if LastUpdate() == Today:
-                    print(f"'[INFO]' All pending offers have been retrieved today from '{Account}' account. Moving to next account.")
+                    print(f"[cyan][INFO][/cyan] All pending offers have been retrieved today from [cyan]{Account}[/cyan] account. Moving to next account.")
 
                 else:
                     ###############################################################################################################################################
@@ -543,7 +519,7 @@ while True:
                             )
                             opening_browser = False
                         except (SessionNotCreatedException, RuntimeError):
-                            print("'[ERROR]' Failed to open the Chrome. It seems Chrome was already open. Killing the application and retrying.")
+                            print("[bold red][ERROR][/bold red] Failed to open the Chrome. It seems Chrome was already open. Killing the application and retrying.")
                             custom_functions.kill_app("chrome")
 
                     #Navigate to eBay's overview webpage to load cookies
@@ -560,7 +536,7 @@ while True:
                     except TimeoutException:
                         pass
 
-                    print(f"'[INFO]' Navigating to '{Account}' profile on eBay.")
+                    print(f"[cyan][INFO][/cyan] Navigating to [cyan]{Account}[/cyan] profile on eBay.")
                     driver.get("https://www.ebay.com/sh/lst/active?status=PENDING_OFFERS&limit=25")
                     driver.switch_to_window(0)
 
@@ -576,7 +552,7 @@ while True:
                     #Confirm if there are any pending offers
                     try:
                         WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".zeroResultsMessage")))
-                        print(f"'[INFO]' No pending offers for '{Account}' account.")
+                        print(f"[cyan][INFO][/cyan] No pending offers for [cyan]{Account}[/cyan] account.")
                     except TimeoutException:
                         #Retrieve and save pending offers
                         GetPendingOffers()
@@ -586,7 +562,7 @@ while True:
 
             ###############################################################################################################################################
             #Open Pending Offers Workbook
-            print("'[INFO]' Opening 'Pending Offers' workbook.")
+            print("[cyan][INFO][/cyan] Opening [cyan]Pending Offers[/cyan] workbook.")
             OffersWb = xl.Book(OffersWbStr)
             OffersSh = OffersWb.sheets("Pending Offers")
             custom_functions.update_directory(OffersWb)
@@ -596,7 +572,7 @@ while True:
             SortAll = OffersWb.macro("Module1.SortAll")
             Reorganize = OffersWb.macro("Module1.Reorganize")
 
-            print("'[INFO]' Refreshing all queries.")
+            print("[cyan][INFO][/cyan] Refreshing all queries.")
             RefreshAll()
             time.sleep(5)
             OffersWb.save()
@@ -611,7 +587,7 @@ while True:
                 LastItem = int(OffersSh.range(f"B{OffersSh.cells.last_cell.row}").end("up").row)
 
                 if FirstItem > LastItem:
-                    print("'[INFO]' No new Pending Offers. Exiting.")
+                    print("[cyan][INFO][/cyan] No new Pending Offers. Exiting.")
                     RawData = None
 
                 elif FirstItem == LastItem:
@@ -645,21 +621,21 @@ while True:
                             driver: object = chrome.start_browser(user_data_dir, profile, headless=True)
                             opening_browser = False
                         except SessionNotCreatedException:
-                            print("'[ERROR]' Failed to open the Chrome. It seems Chrome was already open. Killing the application and retrying.")
+                            print("[bold red][ERROR][/bold red] Failed to open the Chrome. It seems Chrome was already open. Killing the application and retrying.")
                             custom_functions.kill_app("chrome")
 
-                    print(f"'[INFO]' Navigating to '{Account}' profile on eBay.")
+                    print(f"[cyan][INFO][/cyan] Navigating to [cyan]{Account}[/cyan] profile on eBay.")
                     driver.get("https://www.ebay.com/")
                     time.sleep(2)
                     driver.switch_to_window(0)
 
                     for item in RawData:
                         if item[0] != Account:
-                            print(f"'[INFO]' {Account} pending offers are completed. Moving to '{item[0]}'.")
+                            print(f"[cyan][INFO][/cyan] {Account} pending offers are completed. Moving to [cyan]{item[0]}[/cyan].")
                             driver.quit()
                             break
 
-                        print(f"'[INFO]' Navigating to item {item[3]}.")
+                        print(f"[cyan][INFO][/cyan] Navigating to item {item[3]}.")
                         driver.get(f"https://www.ebay.com/bo/seller/showOffers?itemid={item[3]}")
                         driver.switch_to_window(0)
 
@@ -672,7 +648,7 @@ while True:
 
         except Exception:
             driver.save_screenshot("Error.png")
-            print(f"'[ERROR]' An error occurred. An screenshot of the error has been saved to the current working directory.\n\nError:")
+            print(f"[bold red][ERROR][/bold red] An error occurred. A screenshot of the error has been saved to the current working directory.\n\nError:")
             traceback.print_exc()
 
         finally:
@@ -733,7 +709,7 @@ while True:
 
     ##################################################################################################################################################
     #Reorganize the table, save and close the workbook
-    print("'[INFO]' Saving and closing workbook.")
+    print("[cyan][INFO][/cyan] Saving and closing workbook.")
     Reorganize()
     OffersWb.save()
     time.sleep(2)
@@ -741,16 +717,16 @@ while True:
 
     #Send email notification
     outlook.send_email(
-        account="user@example.com",
+        account=sender_email,
         subject=f"eBay Report - Best Offers - {Date}",
         body=body,
-        to=["user@example.com", "user@example.com"],
-        cc=["user@example.com", "user@example.com"],
+        to=to_email,
+        cc=cc_email,
         attachments=[OffersWbStr],
         show=True,
         send=True,
     )
-    print("'[INFO]' Email notification sent.")
+    print("[cyan][INFO][/cyan] Email notification sent.")
 
     #Sleep 60 seconds before starting over
     time.sleep(60)

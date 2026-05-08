@@ -10,8 +10,16 @@ logs/
 output/
 
 # Local config / secrets
-config/config.json
+config/*.json
 .env
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Claude
+.claude/
 
 # Data files
 *.xlsx
