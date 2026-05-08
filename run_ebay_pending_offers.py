@@ -555,7 +555,7 @@ while True:
                         pass
 
                     #Select the desired columns
-                    ebay.CustomizeOffersTable(driver)
+                    ebay.customize_offers_table(driver)
 
                     #Confirm if there are any pending offers
                     try:
