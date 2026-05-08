@@ -29,6 +29,9 @@ to_email: list[str] = [e.strip() for e in os.getenv("TO_EMAIL", "").split(",") i
 cc_email: list[str] = [e.strip() for e in os.getenv("CC_EMAIL", "").split(",") if e.strip()]
 table_pending: str = os.getenv("DB_TABLE_PENDING", "PendingOffers")
 table_aged: str = os.getenv("DB_TABLE_AGED", "AgedInventory")
+for _t in (table_pending, table_aged):
+    if not _t.replace("_", "").isalnum():
+        raise ValueError(f"Invalid table name: {_t!r}")
 
 #Create list of accounts
 Accounts: list[str] = ["SellerOrg", 
