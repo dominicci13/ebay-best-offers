@@ -12,6 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from fc_utils import accounts, chrome, database_utils, custom_functions, ebay, outlook, alert_utils
 from fc_utils.config_utils import get_env
 from fc_utils.schedule_utils import run_on_schedule
+from fc_utils.ui_utils import ask_user
 from fc_utils.accounts import EBAY_PROFILES
 from selenium.common.exceptions import (
     TimeoutException, ElementClickInterceptedException, SessionNotCreatedException
@@ -376,8 +377,6 @@ def main() -> None:
         print("[cyan][INFO][/cyan] Opening [cyan]Pending Offers[/cyan] workbook.")
         offers_wb = xl.Book(offers_wb_path)
         offers_sh = offers_wb.sheets("Pending Offers")
-        custom_functions.update_directory(offers_wb)
-
         refresh_all = offers_wb.macro("Module1.RefreshAll")
         sort_all = offers_wb.macro("Module1.SortAll")
         reorganize = offers_wb.macro("Module1.Reorganize")
@@ -512,4 +511,6 @@ def main() -> None:
         custom_functions.kill_app("chrome")
 
 
+if ask_user("Run now?", "eBay Pending Offers"):
+    main()
 run_on_schedule(main, hour=17, minute=30, day_of_week="mon-sun")
