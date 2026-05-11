@@ -17,6 +17,8 @@ from selenium.common.exceptions import (
     TimeoutException, ElementClickInterceptedException, SessionNotCreatedException
 )
 
+_ebay_account_names: list[str] = list(EBAY_PROFILES.keys())
+
 directory: str = os.getcwd()
 
 load_dotenv()
@@ -455,7 +457,7 @@ def main() -> None:
         <p>Please find attached the eBay best offers cleared today for all accounts.</p>
         <p>Also, please find below a summary:</p>
         <ul>
-        <p><b><u>SellerOrg</u></b></p>
+        <p><b><u>{_ebay_account_names[0]}</u></b></p>
         <li><b>Accepted: </b> {fc_accepted}</li>
         <li><b>Counteroffer: </b> {fc_counter}</li>
         <li><b>Declined: </b> {fc_declined}</li>
@@ -464,7 +466,7 @@ def main() -> None:
         <li><b>Total: </b> {fc_total}</li>
         </ul>
         <ul>
-        <p><b><u>SellerOrg2</u></b></p>
+        <p><b><u>{_ebay_account_names[1]}</u></b></p>
         <li><b>Accepted: </b> {ls_accepted}</li>
         <li><b>Counteroffer: </b> {ls_counter}</li>
         <li><b>Declined: </b> {ls_declined}</li>
