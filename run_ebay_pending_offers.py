@@ -67,7 +67,7 @@ def aged_inventory() -> None:
     Reads the Raw data, Dead, and Slow sheets, concatenates them, clears
     the aged inventory table, and inserts the combined SKU/Status rows.
     """
-    conn = custom_functions.SQLConnection("Reports")
+    conn = custom_functions.sql_connection("Reports")
     cursor = conn.cursor()
 
     cursor.execute(f"DELETE FROM {table_aged}")
@@ -334,7 +334,7 @@ def main() -> None:
             print("[cyan][INFO][/cyan] Uploading [cyan]Aged Inventory[/cyan] items to database.")
             aged_inventory()
 
-        conn = custom_functions.SQLConnection("eBay")
+        conn = custom_functions.sql_connection("eBay")
         cursor = conn.cursor()
 
         # Download pending offers for each account
