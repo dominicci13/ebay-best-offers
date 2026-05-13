@@ -27,6 +27,9 @@ build/
 *.xlsm
 *.csv
 
+# Ruflo plugin artifact (vector DB created by /ruflo-doctor and similar)
+ruvector.db
+
 # OS junk
 .DS_Store
 Thumbs.db
