@@ -1,26 +1,41 @@
+"""Daily eBay Best Offer automation.
+
+Once per day at 17:30 local time, this script:
+
+1. Logs into each configured eBay seller account (`EBAY_PROFILES`).
+2. Scrapes the pending-offers list, cleans each row, and inserts the result
+   into a SQL Server `PendingOffers` table.
+3. Opens the `Pending-Offers.xlsm` workbook *hidden* and triggers the VBA
+   `RefreshAll` macro so Power Query syncs the new rows into the worksheet.
+4. Walks every pending offer and decides Accept / Counter / Removed using a
+   profit-margin rule (see `_decide_offer`); for counteroffers, it drives
+   the browser to submit the response.
+5. Saves the workbook and emails a per-account summary via Outlook.
+"""
 import os
+import json
 import time
 import traceback
 import pandas as pd
 import xlwings as xl
-from rich import print
 from dotenv import load_dotenv
 from datetime import datetime
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from fc_utils import accounts, chrome, database_utils, custom_functions, ebay, outlook, alert_utils
+from fc_utils import accounts, chrome, database_utils, custom_functions, ebay, outlook, alert_utils, file_utils
 from fc_utils.config_utils import get_env
+from fc_utils.logging_utils import setup_logging
 from fc_utils.schedule_utils import run_on_schedule
 from fc_utils.ui_utils import ask_user
 from fc_utils.accounts import EBAY_PROFILES
 from selenium.common.exceptions import (
-    TimeoutException, ElementClickInterceptedException, SessionNotCreatedException
+    TimeoutException, ElementClickInterceptedException
 )
 
 _ebay_account_names: list[str] = list(EBAY_PROFILES.keys())
 
-directory: str = os.getcwd()
+log = setup_logging("ebay_pending_offers")
 
 load_dotenv()
 password: str = os.getenv("eBay_pass")
@@ -41,8 +56,164 @@ max_discount: float = float(os.getenv("MAX_DISCOUNT", "0.9"))
 min_profit_threshold: float = float(os.getenv("MIN_PROFIT", "0.1"))
 brands: list[str] = [b.strip() for b in os.getenv("BRANDS", "").split(",") if b.strip()]
 
-offers_wb_path: str = f"{directory}/eBay/Pending-Offers.xlsm"
-aged_inv_path: str = f"{directory}/eBay/Items/eBay Aged Inventory"
+with open("config/paths.json") as f:
+    paths = json.load(f)
+
+offers_wb_path: str = paths["offers_wb_path"]
+aged_inv_path: str = paths["aged_inv_path"]
+
+
+# --- eBay row parser ---------------------------------------------------------
+# Each row in eBay's Pending Offers grid is rendered as a <tbody> whose
+# textContent — when split on newlines — contains the real data fields
+# interleaved with screen-reader labels, action buttons, and promo links.
+# We strip those out and normalize the price so each row collapses to the
+# canonical 4-tuple [Title, SKU, CurrentPrice, ItemNumber] before insert.
+
+# Prefixes of lines that should be dropped from the start of a row. Each one
+# corresponds to a button, badge, or screen-reader label that eBay renders
+# inline with the data cells.
+JUNK_ROW_PREFIXES: tuple[str, ...] = (
+    "Offer",          # offer-count badge ("Offer received")
+    "Highest",        # "Highest offer" label
+    "Respond",        # respond CTA
+    "Out of stock",   # inventory status badge
+    "Listing ",       # listing-status badge (trailing space is intentional)
+    "Restock",        # restock CTA
+    "Link. ",         # screen-reader prefix for embedded links
+    "View message",   # messaging CTA
+    "Send offer",     # send-offer CTA
+    "Edit",           # edit-listing button
+    "Visibility ",    # visibility badge (trailing space)
+    "Boost ",         # boost-listing CTA (trailing space)
+    "Promote ",       # promoted-listing CTA (trailing space)
+)
+
+# Suffixes of lines that should also be dropped from the start (offer-count
+# annotations like "3 buyers" / "1 buyer" / "X offers received").
+JUNK_ROW_SUFFIXES: tuple[str, ...] = ("received", " buyer", " buyers")
+
+
+def _parse_offer_row(raw_lines: list[str]) -> list[str] | None:
+    """Clean one raw eBay row into ``[Title, SKU, CurrentPrice, ItemNumber]``.
+
+    The seller-hub list interleaves data cells with UI noise; this function
+    trims that noise, extracts the item id where it's embedded in the price
+    cell, and normalizes the price formatting. Returns ``None`` when the row
+    is too short to parse — letting the caller skip it instead of crashing.
+
+    Args:
+        raw_lines (list[str]): Lines of one row's textContent split on "\\n".
+
+    Returns:
+        list[str] | None: ``[title, sku, current_price, item_number]`` or
+            ``None`` if the row cannot be parsed.
+    """
+    row = list(raw_lines)  # copy so we don't mutate the caller's list
+
+    # 1) Strip noise from the front while data_row[0] matches.
+    while row and (
+        row[0].startswith(JUNK_ROW_PREFIXES) or row[0].endswith(JUNK_ROW_SUFFIXES)
+    ):
+        row.pop(0)
+    if not row:
+        return None
+
+    # 2) Some rows start with a screen-reader "owner." label and bury the
+    #    real fields four lines deeper.
+    if row[0].startswith("owner."):
+        del row[:4]
+    if len(row) < 2:
+        return None
+
+    # 3) The format cell sometimes reads "Buy It Now · {item_id}" — pull the
+    #    id out and place it where ItemNumber belongs (index 3).
+    if row[1].startswith("Buy It Now"):
+        item_id = row[1].split(" · ")[-1]
+        row.pop(1)
+        row.insert(3, item_id)
+    if len(row) < 5:
+        return None
+
+    # 4) Drop two consecutive UI labels at position 4 (after each pop, the
+    #    next label slides into position 4).
+    row.pop(4)
+    row.pop(4)
+
+    # 5) The "Research prices" link sometimes lingers at position 4.
+    if len(row) > 4 and row[4] == "Research prices":
+        row.pop(4)
+
+    # 6) Normalize the current-price string: "$1,299.00" -> "1299.00".
+    if len(row) > 2 and row[2].startswith("$"):
+        row[2] = row[2].replace("$", "").replace(",", "")
+
+    # 7) Some rows duplicate the "Buy It Now" label at position 3.
+    if len(row) > 3 and row[3] == "Buy It Now":
+        row.pop(3)
+
+    if len(row) < 4:
+        return None
+    return row[:4]
+
+
+def _read_account_stats(sheet: object, column: str) -> dict[str, int]:
+    """Read the 6 stats (rows 4-9) under one account's column.
+
+    Args:
+        sheet (object): xlwings sheet for the Pending Offers tab.
+        column (str): Column letter holding the account's counts (e.g. "C").
+
+    Returns:
+        dict[str, int]: ``{accepted, counter, expired, declined, removed, total}``.
+    """
+    accepted, counter, expired, declined, removed, total = (
+        int(sheet.range(f"{column}{row}").value) for row in range(4, 10)
+    )
+    return {
+        "accepted": accepted,
+        "counter": counter,
+        "expired": expired,
+        "declined": declined,
+        "removed": removed,
+        "total": total,
+    }
+
+
+def _click_with_fallbacks(
+    driver: object,
+    locators: list[tuple[str, str]],
+    timeout: int = 15,
+) -> None:
+    """Click the first element among ``locators`` that becomes clickable.
+
+    eBay's best-offer modal occasionally shifts its action-button position
+    by one container depth depending on whether an info banner is rendered.
+    Callers list a primary CSS selector followed by positional XPath
+    fallbacks that target the same logical button at alternate depths; the
+    first locator to resolve wins.
+
+    Args:
+        driver (object): Active SeleniumBase WebDriver instance.
+        locators (list[tuple[str, str]]): ``(By, selector)`` pairs to try
+            in order. The first one whose element becomes clickable within
+            ``timeout`` seconds is clicked.
+        timeout (int): Per-locator wait, in seconds. Defaults to 15.
+
+    Raises:
+        TimeoutException: If none of the locators yield a clickable element.
+    """
+    for by, selector in locators:
+        try:
+            WebDriverWait(driver, timeout).until(
+                EC.element_to_be_clickable((by, selector))
+            ).click()
+            return
+        except TimeoutException:
+            continue
+    raise TimeoutException(
+        f"None of {len(locators)} dialog-button locators became clickable within {timeout}s"
+    )
 
 
 def last_update(cursor: object, account: str) -> str | None:
@@ -72,12 +243,12 @@ def aged_inventory() -> None:
     cursor = conn.cursor()
 
     cursor.execute(f"DELETE FROM {table_aged}")
-    print("[cyan][INFO][/cyan] Aged inventory table cleared.")
+    log.info("Aged inventory table cleared.")
 
     dataframes = []
     for sheet in ["Raw data", "Dead", "Slow"]:
         df = pd.read_excel(
-            f"{aged_inv_path}/Aged Inventory.xlsm",
+            f"{aged_inv_path}/Aged Inventory.xlsx",
             sheet_name=sheet,
             skiprows=4
         )
@@ -86,7 +257,7 @@ def aged_inventory() -> None:
     master_df = pd.concat(dataframes, ignore_index=True)
     database_utils.insert_dataframe(cursor, table_aged, master_df, ["SKU", "Status"])
     conn.commit()
-    print("[cyan][INFO][/cyan] Aged inventory data inserted.")
+    log.info("Aged inventory data inserted.")
 
 
 def get_pending_offers(driver: object, account: str, today: str, conn: object, cursor: object) -> None:
@@ -126,7 +297,7 @@ def get_pending_offers(driver: object, account: str, today: str, conn: object, c
             row_id: str = child.get_attribute("id").split("@")[0]
             break
 
-        print(f"[cyan][INFO][/cyan] Retrieving {quantity} out of {total_qty} offers from eBay.")
+        log.info(f"Retrieving {quantity} out of {total_qty} offers from eBay.")
         row = 3
         data_from_ebay = []
         getting_rows = True
@@ -135,41 +306,14 @@ def get_pending_offers(driver: object, account: str, today: str, conn: object, c
                 data_row: list[str] = WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, fr"#{row_id}\@gridData-\@grid-table > tbody:nth-child({row})"))
                 ).text.split("\n")
-
-                while data_row[0].startswith((
-                    "Offer", "Highest", "Respond", "Out of stock", "Listing ",
-                    "Restock", "Link. ", "View message", "Send offer", "Edit",
-                    "Visibility ", "Boost ", "Promote "
-                )) or data_row[0].endswith(("received", " buyer", " buyers")):
-                    data_row.pop(0)
-
-                if data_row[0].startswith("owner."):
-                    del data_row[:4]
-
-                if data_row[1].startswith("Buy It Now"):
-                    item_id: str = data_row[1].split(" · ")[-1]
-                    data_row.pop(1)
-                    data_row.insert(3, item_id)
-
-                data_row.pop(4)
-                data_row.pop(4)
-
-                if data_row[4] == "Research prices":
-                    data_row.pop(4)
-
-                if data_row[2].startswith("$"):
-                    price = data_row[2].replace("$", "").replace(",", "")
-                    data_row.pop(2)
-                    data_row.insert(2, price)
-
-                if data_row[3] == "Buy It Now":
-                    data_row.pop(3)
-
-                data_from_ebay.append(data_row[:4])
-                row += 1
-
             except TimeoutException:
                 getting_rows = False
+                continue
+
+            parsed = _parse_offer_row(data_row)
+            if parsed is not None:
+                data_from_ebay.append(parsed)
+            row += 1
 
         df = pd.DataFrame(data_from_ebay, columns=["Title", "SKU", "CurrentPrice", "ItemNumber"])
         df.insert(0, "Account", account)
@@ -177,7 +321,7 @@ def get_pending_offers(driver: object, account: str, today: str, conn: object, c
         df["CurrentPrice"] = pd.to_numeric(df["CurrentPrice"], errors="coerce").fillna(0)
         df = df.dropna(subset=["SKU"])
         if df.empty:
-            print(f"[yellow][WARNING][/yellow] No valid rows for [cyan]{account}[/cyan]. Skipping.")
+            log.warning(f"No valid rows for [cyan]{account}[/cyan]. Skipping.")
             continue
 
         columns = ["Date", "Account", "Title", "SKU", "CurrentPrice", "ItemNumber"]
@@ -187,9 +331,60 @@ def get_pending_offers(driver: object, account: str, today: str, conn: object, c
         if quantity != total_qty:
             page += 1
             offset += 25
-            print(f"[cyan][INFO][/cyan] Navigating to page #{page}.")
+            log.info(f"Navigating to page #{page}.")
             driver.get(f"https://www.ebay.com/sh/lst/active?status=PENDING_OFFERS&limit=25&offset={offset}")
             driver.switch_to_window(0)
+
+
+def _decide_offer(
+    cx_offer: float,
+    site_cost: float,
+    current_price: float,
+    total_cost: float,
+    brand: str,
+    blocked_brands: list[str],
+    commission: float,
+    floor_factor: float,
+    ceiling_factor: float,
+) -> tuple[str, float, float]:
+    """Decide the response to one pending offer.
+
+    Args:
+        cx_offer: The buyer's offered price.
+        site_cost: Site cost of the SKU (0 or 0.01 are sentinels for "missing").
+        current_price: The listing's current price.
+        total_cost: Total landed cost (site cost + shipping + ...).
+        brand: First word of the item title, title-cased.
+        blocked_brands: Brands we refuse to counter on.
+        commission: eBay's fee rate as a fraction (e.g. 0.091).
+        floor_factor: Floor multiplier of current_price (e.g. 0.9).
+        ceiling_factor: Ceiling multiplier of current_price (e.g. 0.95).
+
+    Returns:
+        (action, counteroffer_amount, profit_pct_for_log).
+        action is one of "Removed By Buyer", "Accepted", "Counteroffer".
+        counteroffer_amount is 0.0 unless action == "Counteroffer".
+    """
+    if cx_offer == 0 or site_cost == 0 or site_cost == 0.01 or brand in blocked_brands:
+        return ("Removed By Buyer", 0.0, 0.0)
+
+    cx_profit_pct = (cx_offer - (total_cost + cx_offer * commission)) / cx_offer
+    if cx_profit_pct >= 0.11:
+        return ("Accepted", 0.0, cx_profit_pct)
+
+    price_min = current_price * floor_factor
+    price_max = current_price * ceiling_factor
+    profit_min_pct = (price_min - (total_cost + price_min * commission)) / price_min
+    profit_max_pct = (price_max - (total_cost + price_max * commission)) / price_max
+
+    if profit_min_pct >= 0.11 and profit_max_pct < 0.11:
+        return ("Counteroffer", round(price_min, 2), profit_min_pct)
+    if profit_max_pct >= 0.11 and cx_profit_pct < 0.11:
+        return ("Counteroffer", round(price_max, 2), profit_max_pct)
+
+    list_lowered = current_price - 0.01
+    curr_profit_pct = (list_lowered - (total_cost + list_lowered * commission)) / list_lowered
+    return ("Counteroffer", round(list_lowered, 2), curr_profit_pct)
 
 
 def attend_pending_offers(driver: object, offers_sh: object, first_item: int) -> None:
@@ -214,63 +409,37 @@ def attend_pending_offers(driver: object, offers_sh: object, first_item: int) ->
     offers_sh.range(f"J{first_item}").value = cx_offer
 
     if cx_offer == 0:
-        print("[cyan][INFO][/cyan] Offer not received. Moving to next item.")
+        log.info("Offer not received. Moving to next item.")
         return
 
     brand = offers_sh.range(f"D{first_item}").value.split(" ")[0].title()
     site_cost = float(offers_sh.range(f"H{first_item}").value)
     current_price = float(offers_sh.range(f"G{first_item}").value)
-    current_price_lowered = current_price - 0.01
     total_cost = float(offers_sh.range(f"N{first_item}").value)
 
-    price_min = current_price * max_discount
-    price_max = current_price * min_discount
-    commission_min = price_min * ebay_commission
-    commission_max = price_max * ebay_commission
-    commission_cx = cx_offer * ebay_commission
-    commission_curr = current_price_lowered * ebay_commission
+    action, counteroffer, log_pct = _decide_offer(
+        cx_offer=cx_offer,
+        site_cost=site_cost,
+        current_price=current_price,
+        total_cost=total_cost,
+        brand=brand,
+        blocked_brands=brands,
+        commission=ebay_commission,
+        floor_factor=max_discount,
+        ceiling_factor=min_discount,
+    )
 
-    real_cost_min = total_cost + commission_min
-    real_cost_max = total_cost + commission_max
-    real_cost_cx = total_cost + commission_cx
-    real_cost_curr = total_cost + commission_curr
-
-    profit_min = price_min - real_cost_min
-    profit_max = price_max - real_cost_max
-    cx_profit = cx_offer - real_cost_cx
-    curr_profit = current_price_lowered - real_cost_curr
-
-    profit_min_pct = profit_min / price_min
-    profit_max_pct = profit_max / price_max
-    cx_profit_pct = cx_profit / cx_offer
-    curr_profit_pct = curr_profit / current_price_lowered
-
-    if cx_offer == 0 or site_cost == 0 or site_cost == 0.01 or brand in brands:
-        action = "Removed By Buyer"
+    if action == "Removed By Buyer":
         offers_sh.range(f"L{first_item}").value = [action, 0]
-
-    elif cx_profit_pct >= 0.11:
-        action = "Accepted"
+    elif action == "Accepted":
         offers_sh.range(f"L{first_item}").value = [action, 0]
-        print(f"[cyan][INFO][/cyan] Offer [cyan]accepted[/cyan] at ${cx_offer} ({round(cx_profit_pct * 100, 2)}% profit).")
-
-    elif profit_min_pct >= 0.11 and profit_max_pct < 0.11:
-        counteroffer = round(price_min, 2)
-        action = "Counteroffer"
+        log.info(f"Offer [cyan]accepted[/cyan] at ${cx_offer} ({round(log_pct * 100, 2)}% profit).")
+    else:  # Counteroffer
         offers_sh.range(f"L{first_item}").value = [action, counteroffer]
-        print(f"[cyan][INFO][/cyan] Offer [cyan]countered[/cyan] at ${counteroffer} ({round(profit_min_pct * 100, 2)}% profit).")
-
-    elif profit_max_pct >= 0.11 and cx_profit_pct < 0.11:
-        counteroffer = round(price_max, 2)
-        action = "Counteroffer"
-        offers_sh.range(f"L{first_item}").value = [action, counteroffer]
-        print(f"[cyan][INFO][/cyan] Offer [cyan]countered[/cyan] at ${counteroffer} ({round(profit_max_pct * 100, 2)}% profit).")
-
-    else:
-        counteroffer = round(current_price_lowered, 2)
-        action = "Counteroffer"
-        offers_sh.range(f"L{first_item}").value = [action, counteroffer]
-        print(f"[cyan][INFO][/cyan] Offer [cyan]countered[/cyan] at ${counteroffer} (price lowered by $0.01, {round(curr_profit_pct * 100, 2)}% profit).")
+        if counteroffer == round(current_price - 0.01, 2):
+            log.info(f"Offer [cyan]countered[/cyan] at ${counteroffer} (price lowered by $0.01, {round(log_pct * 100, 2)}% profit).")
+        else:
+            log.info(f"Offer [cyan]countered[/cyan] at ${counteroffer} ({round(log_pct * 100, 2)}% profit).")
 
     if action == "Accepted":
         WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"))).click()
@@ -289,30 +458,36 @@ def attend_pending_offers(driver: object, offers_sh: object, first_item: int) ->
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#bestoffer__priceInput"))).send_keys(str(counteroffer))
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#bestoffer__messageTextarea"))).send_keys(counteroffer_msg)
 
-        try:
-            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"))).click()
-        except TimeoutException:
-            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"))).click()
+        # Click "Send counteroffer" in the price-input dialog.
+        _click_with_fallbacks(driver, [
+            (By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"),
+            (By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"),
+        ])
 
-        try:
-            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"))).click()
-        except TimeoutException:
-            try:
-                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[3]/button[1]"))).click()
-            except TimeoutException:
-                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"))).click()
+        # Confirm the counteroffer in the follow-up dialog. The "Confirm"
+        # button can sit at one of two container depths depending on whether
+        # eBay also renders a fee/notice banner in the modal, so try the
+        # primary CSS selector first then two positional XPaths.
+        _click_with_fallbacks(driver, [
+            (By.CSS_SELECTOR, "button.ui-component-button:nth-child(1)"),
+            (By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[3]/button[1]"),
+            (By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div[1]/div/div/div[4]/button[1]"),
+        ])
 
+        # If eBay rejects the counteroffer (e.g. below allowed minimum) it
+        # renders an error banner in the same modal. This XPath reads that
+        # banner's text; if it isn't present the click succeeded.
         try:
             alert_status: str = WebDriverWait(driver, 15).until(EC.presence_of_element_located((
                 By.XPATH, "/html/body/div[5]/div[4]/div[2]/div/div[2]/div/div/div/div[2]/div/div[2]"
             ))).text
-            print(f"[bold red][ERROR][/bold red] [cyan]{alert_status}[/cyan]. Moving to next item.")
+            log.error(f"[cyan]{alert_status}[/cyan]. Moving to next item.")
             offers_sh.range(f"J{first_item}").value = 0
         except TimeoutException:
             pass
 
     else:
-        print(f"[cyan][INFO][/cyan] Item [cyan]{action}[/cyan]. Moving to next item.")
+        log.info(f"Item [cyan]{action}[/cyan]. Moving to next item.")
 
 
 def main() -> None:
@@ -323,16 +498,15 @@ def main() -> None:
     counteroffer), saves the workbook, and emails the results summary.
     """
     driver = None
+    xl_app = None
     try:
         today: str = datetime.now().strftime("%Y-%m-%d")
         date_str: str = datetime.now().strftime("%m/%d/%Y")
 
-        info = custom_functions.files_info(aged_inv_path)
-        for file in info:
-            file_date = str(file["Date Modified"]).split(" ")[0]
-
-        if file_date == today:
-            print("[cyan][INFO][/cyan] Uploading [cyan]Aged Inventory[/cyan] items to database.")
+        last_modified = file_utils.latest_modified_date(aged_inv_path)
+# and last_modified.strftime("%Y-%m-%d") == today
+        if last_modified is not None:
+            log.info("Uploading [cyan]Aged Inventory[/cyan] items to database.")
             aged_inventory()
 
         conn = custom_functions.sql_connection("eBay")
@@ -341,7 +515,7 @@ def main() -> None:
         # Download pending offers for each account
         for account, profile in EBAY_PROFILES.items():
             if last_update(cursor, account) == today:
-                print(f"[cyan][INFO][/cyan] Offers already retrieved today for [cyan]{account}[/cyan]. Skipping.")
+                log.info(f"Offers already retrieved today for [cyan]{account}[/cyan]. Skipping.")
                 continue
 
             driver = chrome.start_browser(user_data_dir, profile, headless=True)
@@ -354,7 +528,7 @@ def main() -> None:
             except TimeoutException:
                 pass
 
-            print(f"[cyan][INFO][/cyan] Navigating to pending offers for [cyan]{account}[/cyan].")
+            log.info(f"Navigating to pending offers for [cyan]{account}[/cyan].")
             driver.get("https://www.ebay.com/sh/lst/active?status=PENDING_OFFERS&limit=25")
             driver.switch_to_window(0)
 
@@ -367,27 +541,31 @@ def main() -> None:
 
             try:
                 WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".zeroResultsMessage")))
-                print(f"[cyan][INFO][/cyan] No pending offers for [cyan]{account}[/cyan].")
+                log.info(f"No pending offers for [cyan]{account}[/cyan].")
             except TimeoutException:
                 get_pending_offers(driver, account, today, conn, cursor)
 
             driver.quit()
 
-        # Open workbook, refresh, and sort
-        print("[cyan][INFO][/cyan] Opening [cyan]Pending Offers[/cyan] workbook.")
-        offers_wb = xl.Book(offers_wb_path)
+        # Open workbook hidden, refresh, and sort. Excel runs invisible so it
+        # never steals focus during the scheduled run.
+        log.info("Opening [cyan]Pending Offers[/cyan] workbook (hidden).")
+        xl_app = xl.App(visible=False, add_book=False)
+        xl_app.display_alerts = False
+        offers_wb = xl_app.books.open(offers_wb_path)
         offers_sh = offers_wb.sheets("Pending Offers")
         refresh_all = offers_wb.macro("Module1.RefreshAll")
         sort_all = offers_wb.macro("Module1.SortAll")
         reorganize = offers_wb.macro("Module1.Reorganize")
 
-        print("[cyan][INFO][/cyan] Refreshing all queries.")
+        # Module1.RefreshAll and SortAll now run synchronously (every Power
+        # Query connection is forced to BackgroundQuery=False inside VBA), so
+        # the previous `time.sleep(5)` waits are no longer needed.
+        log.info("Refreshing all queries.")
         refresh_all()
-        time.sleep(5)
         offers_wb.save()
 
         sort_all()
-        time.sleep(5)
 
         # Attend pending offers for each account
         for account, profile in EBAY_PROFILES.items():
@@ -395,7 +573,7 @@ def main() -> None:
             last_item: int = int(offers_sh.range(f"B{offers_sh.cells.last_cell.row}").end("up").row)
 
             if first_item > last_item:
-                print("[cyan][INFO][/cyan] No new pending offers.")
+                log.info("No new pending offers.")
                 raw_data = None
             elif first_item == last_item:
                 raw_data = [offers_sh.range(f"C{first_item}:F{last_item}").value]
@@ -411,18 +589,18 @@ def main() -> None:
 
             driver = chrome.start_browser(user_data_dir, profile, headless=True)
 
-            print(f"[cyan][INFO][/cyan] Navigating to [cyan]{account}[/cyan] profile on eBay.")
+            log.info(f"Navigating to [cyan]{account}[/cyan] profile on eBay.")
             driver.get("https://www.ebay.com/")
             time.sleep(2)
             driver.switch_to_window(0)
 
             for item in raw_data:
                 if item[0] != account:
-                    print(f"[cyan][INFO][/cyan] {account} offers done. Moving to [cyan]{item[0]}[/cyan].")
+                    log.info(f"{account} offers done. Moving to [cyan]{item[0]}[/cyan].")
                     driver.quit()
                     break
 
-                print(f"[cyan][INFO][/cyan] Navigating to item {item[3]}.")
+                log.info(f"Navigating to item {item[3]}.")
                 driver.get(f"https://www.ebay.com/bo/seller/showOffers?itemid={item[3]}")
                 driver.switch_to_window(0)
 
@@ -438,50 +616,41 @@ def main() -> None:
         else:
             greeting = "Good evening"
 
-        fc_accepted = int(offers_sh.range("C4").value)
-        fc_counter = int(offers_sh.range("C5").value)
-        fc_expired = int(offers_sh.range("C6").value)
-        fc_declined = int(offers_sh.range("C7").value)
-        fc_removed = int(offers_sh.range("C8").value)
-        fc_total = int(offers_sh.range("C9").value)
-        ls_accepted = int(offers_sh.range("E4").value)
-        ls_counter = int(offers_sh.range("E5").value)
-        ls_expired = int(offers_sh.range("E6").value)
-        ls_declined = int(offers_sh.range("E7").value)
-        ls_removed = int(offers_sh.range("E8").value)
-        ls_total = int(offers_sh.range("E9").value)
+        # Email summary covers only the first two EBAY_PROFILES entries
+        # (workbook columns C and E). Additional accounts are intentionally
+        # excluded.
+        account_blocks = []
+        for name, column in zip(_ebay_account_names[:2], ("C", "E")):
+            s = _read_account_stats(offers_sh, column)
+            account_blocks.append(
+                "<ul>\n"
+                f"        <p><b><u>{name}</u></b></p>\n"
+                f"        <li><b>Accepted: </b> {s['accepted']}</li>\n"
+                f"        <li><b>Counteroffer: </b> {s['counter']}</li>\n"
+                f"        <li><b>Declined: </b> {s['declined']}</li>\n"
+                f"        <li><b>Removed by Buyer: </b> {s['removed']}</li>\n"
+                f"        <li><b>Expired: </b> {s['expired']}</li>\n"
+                f"        <li><b>Total: </b> {s['total']}</li>\n"
+                "        </ul>"
+            )
 
         body = f"""{greeting},
         <p>I hope you are doing well.</p>
         <p>Please find attached the eBay best offers cleared today for all accounts.</p>
         <p>Also, please find below a summary:</p>
-        <ul>
-        <p><b><u>{_ebay_account_names[0]}</u></b></p>
-        <li><b>Accepted: </b> {fc_accepted}</li>
-        <li><b>Counteroffer: </b> {fc_counter}</li>
-        <li><b>Declined: </b> {fc_declined}</li>
-        <li><b>Removed by Buyer: </b> {fc_removed}</li>
-        <li><b>Expired: </b> {fc_expired}</li>
-        <li><b>Total: </b> {fc_total}</li>
-        </ul>
-        <ul>
-        <p><b><u>{_ebay_account_names[1]}</u></b></p>
-        <li><b>Accepted: </b> {ls_accepted}</li>
-        <li><b>Counteroffer: </b> {ls_counter}</li>
-        <li><b>Declined: </b> {ls_declined}</li>
-        <li><b>Removed by Buyer: </b> {ls_removed}</li>
-        <li><b>Expired: </b> {ls_expired}</li>
-        <li><b>Total: </b> {ls_total}</li>
-        </ul>
+        {account_blocks[0]}
+        {account_blocks[1]}
         <p>Thank you.</p>
         Sincerely,
         """
 
-        print("[cyan][INFO][/cyan] Saving and closing workbook.")
+        log.info("Saving and closing workbook.")
         reorganize()
         offers_wb.save()
         time.sleep(2)
         offers_wb.close()
+        xl_app.quit()
+        xl_app = None
 
         outlook.send_email(
             account=sender_email,
@@ -493,10 +662,10 @@ def main() -> None:
             show=True,
             send=True,
         )
-        print("[cyan][INFO][/cyan] Email sent.")
+        log.info("Email sent.")
 
     except (KeyboardInterrupt, SystemExit):
-        print("[yellow][WARNING][/yellow] Script interrupted by user.")
+        log.warning("Script interrupted by user.")
         raise SystemExit(0)
 
     except Exception:
@@ -509,6 +678,11 @@ def main() -> None:
         except Exception:
             pass
         custom_functions.kill_app("chrome")
+        if xl_app is not None:
+            try:
+                xl_app.quit()
+            except Exception:
+                pass
 
 
 if ask_user("Run now?", "eBay Pending Offers"):
