@@ -504,8 +504,8 @@ def main() -> None:
         date_str: str = datetime.now().strftime("%m/%d/%Y")
 
         last_modified = file_utils.latest_modified_date(aged_inv_path)
-# and last_modified.strftime("%Y-%m-%d") == today
-        if last_modified is not None:
+
+        if last_modified is not None and last_modified.strftime("%Y-%m-%d") == today:
             log.info("Uploading [cyan]Aged Inventory[/cyan] items to database.")
             aged_inventory()
 

@@ -11,8 +11,8 @@ import pytest
 
 # Standard defaults; individual cases override what they need.
 COMMISSION = 0.091
-FLOOR_FACTOR = 0.9       # MAX_DISCOUNT — 90% of list  → floor price
-CEILING_FACTOR = 0.95    # MIN_DISCOUNT — 95% of list  → ceiling price
+FLOOR_FACTOR = 0.9       # MAX_DISCOUNT — 10% of list  → floor price
+CEILING_FACTOR = 0.95    # MIN_DISCOUNT — 5% of list  → ceiling price
 
 
 @pytest.mark.parametrize(
