@@ -8,6 +8,7 @@ __pycache__/
 # Logs and outputs
 logs/
 output/
+downloaded_files/
 
 # Local config / secrets
 config/*.json

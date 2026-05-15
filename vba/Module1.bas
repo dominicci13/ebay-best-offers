@@ -74,11 +74,11 @@ Sub SortAll()
         SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
 
     With POSheet.ListObjects("Pending_Offers").Sort
-         .Header = xlYes
-         .MatchCase = False
-         .Orientation = xlTopToBottom
-         .SortMethod = xlPinYin
-         .Apply
+        .Header = xlYes
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .SortMethod = xlPinYin
+        .Apply
     End With
 
 Cleanup:
@@ -121,11 +121,11 @@ Sub Reorganize()
         SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
 
     With POSheet.ListObjects("Pending_Offers").Sort
-         .Header = xlYes
-         .MatchCase = False
-         .Orientation = xlTopToBottom
-         .SortMethod = xlPinYin
-         .Apply
+        .Header = xlYes
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .SortMethod = xlPinYin
+        .Apply
     End With
 
 Cleanup:
