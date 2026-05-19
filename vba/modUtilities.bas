@@ -1,12 +1,11 @@
-Attribute VB_Name = "Module1"
+Attribute VB_Name = "modUtilities"
 Dim POSheet As Worksheet
 Option Explicit
 
-' --- RefreshAll ---------------------------------------------------------------
-' Re-points every Power Query connection to the current OneDrive directory
-' (via QueriesAddress in Module2), then refreshes each connection
-' synchronously. Returns only once every query has finished, so the calling
-' Python code does not need a `time.sleep()` to wait for background queries.
+' --- refresh ---------------------------------------------------------------
+' Refreshes each connection synchronously. Returns only once every query has
+' finished, so the calling Python code does not need a `time.sleep()` to wait
+' for background queries.
 '
 ' Performance toggles disable screen updates, automatic calculation, events,
 ' and alerts during the refresh; the original Application state is restored
@@ -14,7 +13,7 @@ Option Explicit
 '
 ' Side effect: each WorkbookConnection's BackgroundQuery flag is set to
 ' False and persists in the saved workbook. This is intentional.
-Sub RefreshAll()
+Sub refresh()
 
     Dim conn As WorkbookConnection
     Dim prevCalc As Long
@@ -26,8 +25,6 @@ Sub RefreshAll()
     Application.Calculation = xlCalculationManual
     Application.EnableEvents = False
     Application.DisplayAlerts = False
-
-    Call QueriesAddress
 
     For Each conn In ThisWorkbook.Connections
         On Error Resume Next
@@ -43,17 +40,17 @@ Cleanup:
     Application.ScreenUpdating = True
 
     If Err.Number <> 0 Then
-        MsgBox "RefreshAll error " & Err.Number & ": " & Err.Description, vbExclamation
+        MsgBox "refresh error " & Err.Number & ": " & Err.Description, vbExclamation
     End If
 
 End Sub
 
 
-' --- SortAll ------------------------------------------------------------------
+' --- sortCols ------------------------------------------------------------------
 ' Sorts the Pending_Offers ListObject ascending by Cx Offer, then by Account.
 ' Used after pending offers are loaded so the worksheet groups offers by
 ' account in the order the Python script attends them.
-Sub SortAll()
+Sub sortCols()
 
     Dim prevCalc As Long
     On Error GoTo Cleanup
@@ -87,17 +84,17 @@ Cleanup:
     Application.ScreenUpdating = True
 
     If Err.Number <> 0 Then
-        MsgBox "SortAll error " & Err.Number & ": " & Err.Description, vbExclamation
+        MsgBox "sortCols error " & Err.Number & ": " & Err.Description, vbExclamation
     End If
 
 End Sub
 
 
-' --- Reorganize ---------------------------------------------------------------
+' --- reorder ---------------------------------------------------------------
 ' Final tidy-up sort once the offers have been attended: orders by Date
 ' (descending), then Account (ascending), then SKU (ascending). Called
 ' immediately before the workbook is saved and emailed.
-Sub Reorganize()
+Sub reorder()
 
     Dim prevCalc As Long
     On Error GoTo Cleanup
@@ -134,7 +131,7 @@ Cleanup:
     Application.ScreenUpdating = True
 
     If Err.Number <> 0 Then
-        MsgBox "Reorganize error " & Err.Number & ": " & Err.Description, vbExclamation
+        MsgBox "reorder error " & Err.Number & ": " & Err.Description, vbExclamation
     End If
 
 End Sub
