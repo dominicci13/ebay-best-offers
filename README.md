@@ -153,6 +153,7 @@ at 17:30 daily via APScheduler.
 |---|---|
 | `eBay_pass` | eBay account password |
 | `CHROME_USER_DATA_DIR` | Path to the Chrome automation profile directory |
+| `ALERT_EMAIL` | Outlook recipient for unhandled-exception crash reports |
 | `SENDER_EMAIL` | Outlook account used to send the report email |
 | `TO_EMAIL` | Comma-separated list of recipient email addresses |
 | `CC_EMAIL` | Comma-separated list of CC email addresses |
