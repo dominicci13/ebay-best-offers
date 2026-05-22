@@ -103,7 +103,7 @@ version-controlled alongside the Python.
 ## Logging
 
 ```text
-21:03:43 INFO     Navigating to pending offers for SellerOrg.
+21:03:43 INFO     Navigating to pending offers for AccountKeyA.
 21:03:51 INFO     Retrieving 23 out of 23 offers from eBay.
 21:04:09 INFO     Offer accepted at $190 (11.8% profit).
 21:04:14 INFO     Offer countered at $185.00 (price lowered by $0.01, 7.5% profit).
@@ -118,8 +118,7 @@ log = setup_logging("ebay_pending_offers")
 
 `setup_logging` wires a Rich console handler (colorized output, markup
 rendering, rich tracebacks) and a 1 MB rotating file handler writing to
-`logs/<name>.log`. Available to every SellerOrg automation that imports
-`fc_utils`.
+`logs/<name>.log`. Available to every automation that imports `fc_utils`.
 
 ## Setup
 
