@@ -25,12 +25,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from fc_utils import accounts, alert_utils, chrome, custom_functions, database_utils, ebay, file_utils, greeting_for, outlook
-from fc_utils.accounts import EBAY_PROFILES
-from fc_utils.config_utils import get_env, load_config_safe
-from fc_utils.logging_utils import setup_logging
-from fc_utils.schedule_utils import run_on_schedule
-from fc_utils.ui_utils import ask_user
+from seller_automation_utils import accounts, alert_utils, chrome, custom_functions, database_utils, ebay, file_utils, greeting_for, outlook
+from seller_automation_utils.accounts import EBAY_PROFILES
+from seller_automation_utils.config_utils import get_env, load_config_safe
+from seller_automation_utils.logging_utils import setup_logging
+from seller_automation_utils.schedule_utils import run_on_schedule
+from seller_automation_utils.ui_utils import ask_user
 
 
 _ebay_account_names: list[str] = list(EBAY_PROFILES.keys())

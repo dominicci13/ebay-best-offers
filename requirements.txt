@@ -72,4 +72,4 @@ wheel==0.47.0
 wsproto==1.2.0
 xlwings==0.35.3
 
-fc-utils @ git+https://github.com/dominicci13/shared-python-utils.git
+seller-automation-utils @ git+https://github.com/dominicci13/shared-python-utils.git

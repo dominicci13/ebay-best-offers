@@ -89,7 +89,7 @@ browser scrape. This version tunes the first two:
 - **Excel runs hidden.** The script opens Excel via
   `xl.App(visible=False, add_book=False)` and quits it in `finally`. No
   flashing window, no stolen focus, safe for scheduled runs.
-- **Bulk column read.** `fc_utils.custom_functions.first_empty_row` now
+- **Bulk column read.** `seller_automation_utils.custom_functions.first_empty_row` now
   reads the column in one COM round-trip and scans in Python, instead of
   one COM call per cell. The win scales with table size.
 - **VBA hardening.** `RefreshAll`, `SortAll`, and `Reorganize` all run
@@ -112,13 +112,13 @@ version-controlled alongside the Python.
 Configured once via the shared helper:
 
 ```python
-from fc_utils.logging_utils import setup_logging
+from seller_automation_utils.logging_utils import setup_logging
 log = setup_logging("ebay_best_offers")
 ```
 
 `setup_logging` wires a Rich console handler (colorized output, markup
 rendering, rich tracebacks) and a 1 MB rotating file handler writing to
-`logs/<name>.log`. Available to every automation that imports `fc_utils`.
+`logs/<name>.log`. Available to every automation that imports `seller_automation_utils`.
 
 ## Setup
 
