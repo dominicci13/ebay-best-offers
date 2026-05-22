@@ -1,6 +1,8 @@
-Attribute VB_Name = "modUtilities"
-Dim POSheet As Worksheet
 Option Explicit
+
+' Module-level scratch — set by sortCols / reorder before each sort op.
+Dim POSheet As Worksheet
+
 
 ' --- refresh ---------------------------------------------------------------
 ' Refreshes each connection synchronously. Returns only once every query has
@@ -30,7 +32,7 @@ Sub refresh()
         On Error Resume Next
         conn.OLEDBConnection.BackgroundQuery = False
         On Error GoTo Cleanup
-        conn.Refresh
+        conn.refresh
     Next conn
 
 Cleanup:

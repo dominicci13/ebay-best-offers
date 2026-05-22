@@ -12,55 +12,76 @@ Once per day at 17:30 local time, this script:
    the browser to submit the response.
 5. Saves the workbook and emails a per-account summary via Outlook.
 """
-import os
-import json
 import time
 import traceback
+from datetime import datetime
+from pathlib import Path
+
 import pandas as pd
 import xlwings as xl
 from dotenv import load_dotenv
-from datetime import datetime
+from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from fc_utils import accounts, chrome, database_utils, custom_functions, ebay, outlook, alert_utils, file_utils
-from fc_utils.config_utils import get_env
+from selenium.webdriver.support.ui import WebDriverWait
+
+from fc_utils import accounts, alert_utils, chrome, custom_functions, database_utils, ebay, file_utils, greeting_for, outlook
+from fc_utils.accounts import EBAY_PROFILES
+from fc_utils.config_utils import get_env, load_config_safe
 from fc_utils.logging_utils import setup_logging
 from fc_utils.schedule_utils import run_on_schedule
 from fc_utils.ui_utils import ask_user
-from fc_utils.accounts import EBAY_PROFILES
-from selenium.common.exceptions import (
-    TimeoutException, ElementClickInterceptedException
-)
+
 
 _ebay_account_names: list[str] = list(EBAY_PROFILES.keys())
 
 log = setup_logging("ebay_pending_offers")
-
 load_dotenv()
-password: str = os.getenv("eBay_pass")
-sender_email: str = os.getenv("SENDER_EMAIL", "")
-to_email: list[str] = [e.strip() for e in os.getenv("TO_EMAIL", "").split(",") if e.strip()]
-cc_email: list[str] = [e.strip() for e in os.getenv("CC_EMAIL", "").split(",") if e.strip()]
-table_pending: str = os.getenv("DB_TABLE_PENDING", "PendingOffers")
-table_aged: str = os.getenv("DB_TABLE_AGED", "AgedInventory")
+password: str = get_env("eBay_pass", required=True)
 user_data_dir: str = get_env("CHROME_USER_DATA_DIR", required=True)
-
+sender_email: str = get_env("SENDER_EMAIL", required=True)
+to_email: list[str] = [e.strip() for e in (get_env("TO_EMAIL", required=True) or "").split(",") if e.strip()]
+cc_email: list[str] = [e.strip() for e in (get_env("CC_EMAIL", default="") or "").split(",") if e.strip()]
+table_pending: str = get_env("DB_TABLE_PENDING", default="PendingOffers") or "PendingOffers"
+table_aged: str = get_env("DB_TABLE_AGED", default="AgedInventory") or "AgedInventory"
 for _t in (table_pending, table_aged):
     if not _t.replace("_", "").isalnum():
         raise ValueError(f"Invalid table name: {_t!r}")
 
-ebay_commission: float = float(os.getenv("EBAY_COMMISSION", "0.091"))
-min_discount: float = float(os.getenv("MIN_DISCOUNT", "0.95"))
-max_discount: float = float(os.getenv("MAX_DISCOUNT", "0.9"))
-min_profit_threshold: float = float(os.getenv("MIN_PROFIT", "0.1"))
-brands: list[str] = [b.strip() for b in os.getenv("BRANDS", "").split(",") if b.strip()]
+ebay_commission: float = float(get_env("EBAY_COMMISSION", default="0.091") or "0.091")
+min_discount: float = float(get_env("MIN_DISCOUNT", default="0.95") or "0.95")
+max_discount: float = float(get_env("MAX_DISCOUNT", default="0.9") or "0.9")
+min_profit_threshold: float = float(get_env("MIN_PROFIT", default="0.1") or "0.1")
+brands: list[str] = [b.strip() for b in (get_env("BRANDS", default="") or "").split(",") if b.strip()]
 
-with open("config/paths.json") as f:
-    paths = json.load(f)
+_paths = load_config_safe(Path(__file__).resolve().parent / "config" / "paths.json")
+offers_wb_path: str = _paths["offers_wb_path"]
+aged_inv_path: str = _paths["aged_inv_path"]
 
-offers_wb_path: str = paths["offers_wb_path"]
-aged_inv_path: str = paths["aged_inv_path"]
+
+def _email_body(account_blocks: list[str]) -> str:
+    """Build the per-day summary email body.
+
+    Wraps the time-of-day greeting (`greeting_for()`) around the workbook-
+    derived per-account stat blocks. Called at email-send time so the greeting
+    reflects the actual send hour rather than the script-import hour.
+
+    Args:
+        account_blocks: HTML `<ul>` blocks (one per included account) built
+            from `_read_account_stats(...)` reads.
+
+    Returns:
+        Full HTML body ready to pass to `outlook.send_email(body=...)`.
+    """
+    return f"""{greeting_for()},
+        <p>I hope you are doing well.</p>
+        <p>Please find attached the eBay best offers cleared today for all accounts.</p>
+        <p>Also, please find below a summary:</p>
+        {account_blocks[0]}
+        {account_blocks[1]}
+        <p>Thank you.</p>
+        Sincerely,
+        """
 
 
 # --- eBay row parser ---------------------------------------------------------
@@ -554,18 +575,16 @@ def main() -> None:
         xl_app.display_alerts = False
         offers_wb = xl_app.books.open(offers_wb_path)
         offers_sh = offers_wb.sheets("Pending Offers")
-        refresh_all = offers_wb.macro("Module1.RefreshAll")
-        sort_all = offers_wb.macro("Module1.SortAll")
-        reorganize = offers_wb.macro("Module1.Reorganize")
 
-        # Module1.RefreshAll and SortAll now run synchronously (every Power
-        # Query connection is forced to BackgroundQuery=False inside VBA), so
-        # the previous `time.sleep(5)` waits are no longer needed.
+        # modUtilities.refresh + sortCols + reorder now run synchronously
+        # (every Power Query connection is forced to BackgroundQuery=False
+        # inside VBA), so the previous `time.sleep(5)` waits are no longer
+        # needed.
         log.info("Refreshing all queries.")
-        refresh_all()
+        offers_wb.macro("modUtilities.refresh")()
         offers_wb.save()
 
-        sort_all()
+        offers_wb.macro("modUtilities.sortCols")()
 
         # Attend pending offers for each account
         for account, profile in EBAY_PROFILES.items():
@@ -607,15 +626,6 @@ def main() -> None:
                 attend_pending_offers(driver, offers_sh, first_item)
                 first_item += 1
 
-        # Build email summary from workbook cells
-        current_hour = datetime.now().hour
-        if 5 <= current_hour <= 11:
-            greeting = "Good morning"
-        elif 12 <= current_hour <= 17:
-            greeting = "Good afternoon"
-        else:
-            greeting = "Good evening"
-
         # Email summary covers only the first two EBAY_PROFILES entries
         # (workbook columns C and E). Additional accounts are intentionally
         # excluded.
@@ -634,18 +644,8 @@ def main() -> None:
                 "        </ul>"
             )
 
-        body = f"""{greeting},
-        <p>I hope you are doing well.</p>
-        <p>Please find attached the eBay best offers cleared today for all accounts.</p>
-        <p>Also, please find below a summary:</p>
-        {account_blocks[0]}
-        {account_blocks[1]}
-        <p>Thank you.</p>
-        Sincerely,
-        """
-
         log.info("Saving and closing workbook.")
-        reorganize()
+        offers_wb.macro("modUtilities.reorder")()
         offers_wb.save()
         time.sleep(2)
         offers_wb.close()
@@ -655,7 +655,7 @@ def main() -> None:
         outlook.send_email(
             account=sender_email,
             subject=f"eBay Report - Best Offers - {date_str}",
-            body=body,
+            body=_email_body(account_blocks),
             to=to_email,
             cc=cc_email,
             attachments=[offers_wb_path],

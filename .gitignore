@@ -10,8 +10,13 @@ logs/
 output/
 downloaded_files/
 
+# Screenshots — ignore everything except .gitkeep so the folder is tracked
+screenshots/*
+!screenshots/.gitkeep
+
 # Local config / secrets
 config/*.json
+!config/*.json.example
 .env
 
 # Build artifacts
@@ -19,9 +24,14 @@ config/*.json
 dist/
 build/
 
-# Claude
-.claude/
+# Working artifacts
 tasks/
+.claude/
+CLAUDE.md
+*.db
+
+# Pytest cache
+.pytest_cache/
 
 # Data files
 *.xlsx
@@ -29,9 +39,5 @@ tasks/
 *.xlsm
 *.csv
 
-# Ruflo plugin artifact (vector DB created by /ruflo-doctor and similar)
-ruvector.db
-
 # OS junk
 .DS_Store
-Thumbs.db
