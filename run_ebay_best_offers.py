@@ -35,7 +35,7 @@ from fc_utils.ui_utils import ask_user
 
 _ebay_account_names: list[str] = list(EBAY_PROFILES.keys())
 
-log = setup_logging("ebay_pending_offers")
+log = setup_logging("ebay_best_offers")
 load_dotenv()
 password: str = get_env("eBay_pass", required=True)
 user_data_dir: str = get_env("CHROME_USER_DATA_DIR", required=True)
@@ -669,7 +669,7 @@ def main() -> None:
         raise SystemExit(0)
 
     except Exception:
-        alert_utils.handle_crash(driver, traceback.format_exc(), "eBay Pending Offers")
+        alert_utils.handle_crash(driver, traceback.format_exc(), "eBay Best Offers")
         raise SystemExit(1)
 
     finally:
@@ -685,6 +685,6 @@ def main() -> None:
                 pass
 
 
-if ask_user("Run now?", "eBay Pending Offers"):
+if ask_user("Run now?", "eBay Best Offers"):
     main()
 run_on_schedule(main, hour=17, minute=30, day_of_week="mon-sun")

@@ -1,4 +1,4 @@
-# ebay-pending-offers
+# ebay-best-offers
 
 Daily automation that closes out every pending eBay Best Offer across a fleet
 of seller accounts. It scrapes the seller-hub list, syncs the rows into SQL
@@ -113,7 +113,7 @@ Configured once via the shared helper:
 
 ```python
 from fc_utils.logging_utils import setup_logging
-log = setup_logging("ebay_pending_offers")
+log = setup_logging("ebay_best_offers")
 ```
 
 `setup_logging` wires a Rich console handler (colorized output, markup
@@ -140,7 +140,7 @@ Edit `.env` with your credentials, SQL table names, and offer thresholds.
 ## Run
 
 ```bash
-python run_ebay_pending_offers.py
+python run_ebay_best_offers.py
 ```
 
 The script prompts whether to run immediately, then schedules itself to run
@@ -168,7 +168,7 @@ at 17:30 daily via APScheduler.
 
 ```
 .
-├── run_ebay_pending_offers.py   # the script — single file by design
+├── run_ebay_best_offers.py   # the script — single file by design
 ├── vba/
 │   └── Module1.bas              # canonical source for the workbook's VBA
 ├── config/

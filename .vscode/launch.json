@@ -5,7 +5,7 @@
       "name": "Run Automation",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/run_ebay_pending_offers.py",
+      "program": "${workspaceFolder}/run_ebay_best_offers.py",
       "console": "integratedTerminal"
     }
   ]

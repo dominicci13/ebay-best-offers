@@ -1,6 +1,6 @@
-"""Shared pytest fixtures for the ebay-pending-offers test suite.
+"""Shared pytest fixtures for the ebay-best-offers test suite.
 
-The main script (`run_ebay_pending_offers.py`) executes side-effecting
+The main script (`run_ebay_best_offers.py`) executes side-effecting
 top-level statements at import time (`ask_user`, `run_on_schedule`), so we
 slice individual pure functions out of the source rather than importing the
 module. This keeps tests fast and free of Excel/Selenium dependencies.
@@ -12,7 +12,7 @@ import pathlib
 import pytest
 
 
-SCRIPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "run_ebay_pending_offers.py"
+SCRIPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "run_ebay_best_offers.py"
 
 
 def _slice_function(src: str, name: str) -> str:
