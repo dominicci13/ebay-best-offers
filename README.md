@@ -36,7 +36,7 @@ flowchart LR
 
     subgraph wb[Pending-Offers.xlsm — hidden]
         direction TB
-        refresh[Module1.RefreshAll<br/>sync Power Query] --> sort[Module1.SortAll]
+        refresh[modUtilities.refresh<br/>sync Power Query] --> sort[modUtilities.sortCols]
     end
 
     sort --> decide
@@ -48,7 +48,7 @@ flowchart LR
         act --> write[Write outcome to sheet]
     end
 
-    write --> finalize[Module1.Reorganize<br/>save workbook]
+    write --> finalize[modUtilities.reorder<br/>save workbook]
     finalize --> email[Outlook email<br/>per-account summary]
 ```
 
@@ -89,7 +89,7 @@ to submit it.
 The script's three slowest legs are Excel refresh, Excel cell I/O, and the
 browser scrape. This version tunes the first two:
 
-- **Synchronous query refresh.** `Module1.RefreshAll` no longer calls
+- **Synchronous query refresh.** `modUtilities.refresh` no longer calls
   `ThisWorkbook.RefreshAll` (which dispatches every Power Query
   asynchronously and returns immediately). It iterates each connection,
   forces `BackgroundQuery = False`, and refreshes them in order. The Python
@@ -101,12 +101,12 @@ browser scrape. This version tunes the first two:
 - **Bulk column read.** `seller_automation_utils.custom_functions.first_empty_row` now
   reads the column in one COM round-trip and scans in Python, instead of
   one COM call per cell. The win scales with table size.
-- **VBA hardening.** `RefreshAll`, `SortAll`, and `Reorganize` all run
+- **VBA hardening.** `refresh`, `sortCols`, and `reorder` all run
   inside `ScreenUpdating=False`, `Calculation=xlCalculationManual`,
   `EnableEvents=False`, with `On Error GoTo Cleanup` blocks that restore
   the Application state even on failure.
 
-The canonical VBA source lives in `vba/Module1.bas` so the macros are
+The canonical VBA source lives in `vba/modUtilities.bas` so the macros are
 version-controlled alongside the Python.
 
 ## Logging
@@ -135,7 +135,7 @@ rendering, rich tracebacks) and a 1 MB rotating file handler writing to
 .
 ├── run_ebay_best_offers.py   # the script — single file by design
 ├── vba/
-│   └── Module1.bas              # canonical source for the workbook's VBA
+│   └── modUtilities.bas         # canonical source for the workbook's VBA
 ├── config/
 │   ├── accounts.json            # eBay profile names (gitignored)
 │   └── paths.json               # workbook & aged-inventory paths (gitignored)
@@ -146,29 +146,37 @@ rendering, rich tracebacks) and a 1 MB rotating file handler writing to
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Clone and create the venv
 
-```bash
-pip install -r requirements.txt
-pip install git+https://github.com/dominicci13/shared-python-utils.git
+```powershell
+git clone https://github.com/dominicci13/ebay-best-offers.git
+cd ebay-best-offers
+py -3.12 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install git+https://github.com/dominicci13/shared-python-utils.git
 ```
 
-### 2. Configure environment
+### 2. Configure
 
-```bash
-cp .env.example .env
+```powershell
+copy .env.example .env
+copy config\accounts.json.example config\accounts.json
+copy config\paths.json.example config\paths.json
 ```
 
-Edit `.env` with your credentials, SQL table names, and offer thresholds.
+Edit each file with real values — credentials, SQL table names, and offer thresholds in `.env`; eBay profiles and workbook paths in the two `config/*.json` files. All are gitignored.
 
-### 3. Run
+### 3. VBA module (one-time per workbook)
 
-```bash
-python run_ebay_best_offers.py
+`Pending-Offers.xlsm` must contain the canonical `modUtilities` from `vba/modUtilities.bas`. Open the workbook in Excel, press **Alt+F11**, insert a module named `modUtilities`, and paste the contents of `vba/modUtilities.bas`. Save the workbook.
+
+### 4. Run
+
+```powershell
+.venv\Scripts\python run_ebay_best_offers.py
 ```
 
-The script prompts whether to run immediately, then schedules itself to run
-at 17:30 daily via APScheduler.
+The script prompts "Run now?" — answer **Y** to execute immediately, or **N** to register the APScheduler job and idle until the next **17:30 daily** trigger.
 
 ## Environment variables
 
