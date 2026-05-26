@@ -10,6 +10,15 @@ summary. The interesting work is the **decision rule**, the
 **resilient scraper** that survives eBay rendering screen-reader noise inline
 with the data.
 
+## Daily flow
+
+1. **Scrape pending offers** — log into each seller account and scrape the seller-hub list of pending Best Offers.
+2. **Sync to SQL Server** — sync the scraped rows into SQL Server (`PendingOffers`).
+3. **Refresh pricing workbook** — refresh the pricing workbook synchronously via Power Query.
+4. **Decide per offer** — run the profit-margin decision rule to choose Accept / Counter / Remove for each offer.
+5. **Act in the browser** — drive the browser to act on each decision and write the outcome back to the sheet.
+6. **Email summary** — save the workbook and email an end-of-day per-account summary via Outlook.
+
 ## Architecture
 
 ```mermaid
@@ -120,6 +129,21 @@ log = setup_logging("ebay_best_offers")
 rendering, rich tracebacks) and a 1 MB rotating file handler writing to
 `logs/<name>.log`. Available to every automation that imports `seller_automation_utils`.
 
+## Project layout
+
+```
+.
+├── run_ebay_best_offers.py   # the script — single file by design
+├── vba/
+│   └── Module1.bas              # canonical source for the workbook's VBA
+├── config/
+│   ├── accounts.json            # eBay profile names (gitignored)
+│   └── paths.json               # workbook & aged-inventory paths (gitignored)
+├── logs/                        # rotating logger output (gitignored)
+├── requirements.txt
+└── README.md
+```
+
 ## Setup
 
 ### 1. Install dependencies
@@ -137,7 +161,7 @@ cp .env.example .env
 
 Edit `.env` with your credentials, SQL table names, and offer thresholds.
 
-## Run
+### 3. Run
 
 ```bash
 python run_ebay_best_offers.py
@@ -163,21 +187,6 @@ at 17:30 daily via APScheduler.
 | `MAX_DISCOUNT` | Floor price as a fraction of list (default: `0.9`) |
 | `MIN_PROFIT` | Minimum profit margin (currently informational — code uses `0.11`) |
 | `BRANDS` | Comma-separated list of blocked brand names |
-
-## Project layout
-
-```
-.
-├── run_ebay_best_offers.py   # the script — single file by design
-├── vba/
-│   └── Module1.bas              # canonical source for the workbook's VBA
-├── config/
-│   ├── accounts.json            # eBay profile names (gitignored)
-│   └── paths.json               # workbook & aged-inventory paths (gitignored)
-├── logs/                        # rotating logger output (gitignored)
-├── requirements.txt
-└── README.md
-```
 
 ## Author
 
