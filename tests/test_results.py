@@ -1,0 +1,113 @@
+"""Branch tests for build_results — the full archive record per offer.
+
+Covers every decision outcome and checks that not-applicable fields come back as
+NULL (NaN in the frame, converted to SQL NULL at insert time) rather than 0.
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+import run_ebay_best_offers as script
+
+SETTINGS = {
+    "commission": 0.12,
+    "min_profit": 0.09,
+    "slow_min_profit": 0.06,
+    "dead_min_profit": 0.04,
+    "sell_below_cost_min_profit": 0.04,
+    "min_discount": 0.05,
+    "max_discount": 0.10,
+    "shipping_floor": 12.0,
+}
+
+# One row per outcome. Columns match an enriched offer with cx_offer attached.
+OFFERS = pd.DataFrame(
+    [
+        # date, account, title, sku, current_price, item_number, out_of_stock, site_cost, aged_status, cx_offer, sell_below_cost
+        ("2026-07-02", "Account1", "Cold CS-22C",  "CS-22C", 109.99, "111", False, 69.17, "N/A", 90.0, False),    # counter
+        ("2026-07-02", "Account1", "Sony A7",      "SNY",    250.00, "222", False, 100.00, "Slow", 200.0, False),  # accept
+        ("2026-07-02", "Account1", "Kodak EKMSD",  "EKMSD",  24.29,  "333", False, 35.64, "N/A", 20.0, False),     # decline
+        ("2026-07-02", "Account1", "Sony Expired", "SZ",     100.00, "444", True,  50.00, "N/A", 0.0, False),      # expired
+        ("2026-07-02", "Account1", "Sony NoCost",  "SQ",     100.00, "555", False, 0.00,  "N/A", 80.0, False),     # missing cost
+        ("2026-07-02", "Account1", "Dead Item",    "DED",    3849.0, "666", False, 2800.0, "Dead", 3500.0, False), # dead accepts
+        ("2026-07-02", "Account1", "OOS Item",     "OOS",    200.00, "777", True,  120.00, "N/A", 150.0, False),   # out of stock
+    ],
+    columns=["date", "account", "title", "sku", "current_price", "item_number",
+             "out_of_stock", "site_cost", "aged_status", "cx_offer", "sell_below_cost"],
+)
+
+
+def _by_item():
+    """Run build_results and index the rows by item_number for easy assertions."""
+    result = script.build_results(OFFERS, SETTINGS)
+    assert list(result.columns) == script.RESULT_COLUMNS
+    return {row.item_number: row for row in result.itertuples(index=False)}
+
+
+def test_shape_and_report_date():
+    result = script.build_results(OFFERS, SETTINGS)
+    assert len(result) == len(OFFERS)
+    assert (result["report_date"] == "2026-07-02").all()
+
+
+def test_counter_row_has_price_discount_and_margin():
+    row = _by_item()["111"]
+    assert row.action == "Counteroffer"
+    assert 109.99 * 0.90 <= row.counter <= 109.99 * 0.95   # inside the discount band
+    assert row.discount == round((109.99 - row.counter) / 109.99, 4)
+    assert row.counter_margin >= SETTINGS["min_profit"]
+    assert row.buyer_margin < SETTINGS["min_profit"]       # the buyer's own low offer wouldn't clear
+
+
+def test_accepted_row_has_buyer_margin_only():
+    row = _by_item()["222"]
+    assert row.action == "Accepted"
+    assert row.buyer_margin >= SETTINGS["min_profit"]
+    assert pd.isna(row.counter)
+    assert pd.isna(row.discount)
+    assert pd.isna(row.counter_margin)
+
+
+def test_declined_row_keeps_buyer_margin_no_counter():
+    row = _by_item()["333"]
+    assert row.action == "Declined"
+    assert row.buyer_margin < SETTINGS["min_profit"]
+    assert pd.isna(row.counter)
+    assert pd.isna(row.counter_margin)
+
+
+def test_expired_row_has_no_margins():
+    row = _by_item()["444"]
+    assert row.action == "Expired Offer"
+    assert row.out_of_stock is True
+    assert pd.isna(row.buyer_margin)
+    assert pd.isna(row.counter)
+
+
+def test_missing_cost_row_has_no_buyer_margin():
+    row = _by_item()["555"]
+    assert row.action == "Missing Site Cost"
+    assert pd.isna(row.buyer_margin)  # can't price without a real cost
+    assert pd.isna(row.counter)
+
+
+def test_out_of_stock_row_is_skipped_no_counter():
+    row = _by_item()["777"]
+    assert row.action == "Out of Stock"
+    assert pd.isna(row.counter)
+    assert pd.isna(row.counter_margin)
+
+
+def test_dead_item_accepts_below_default_margin():
+    row = _by_item()["666"]
+    assert row.action == "Accepted"
+    # its margin clears the 4% Dead floor but not the 9% default
+    assert SETTINGS["dead_min_profit"] <= row.buyer_margin < SETTINGS["min_profit"]
+    assert pd.isna(row.counter)
+
+
+def test_computed_costs_match_helpers():
+    row = _by_item()["111"]
+    floor = SETTINGS["shipping_floor"]
+    assert row.est_shipping == script.est_shipping(69.17, floor)      # tiered on site cost
+    assert row.total_cost == round(69.17 + script.est_shipping(69.17, floor), 2)

@@ -30,6 +30,7 @@ build/
 # Working artifacts
 tasks/
 .claude/
+.claude-flow/
 CLAUDE.md
 *.db
 
@@ -42,5 +43,6 @@ CLAUDE.md
 # OS junk
 .DS_Store
 
-# Pytest cache
+# Pytest cache / coverage
 .pytest_cache/
+.coverage

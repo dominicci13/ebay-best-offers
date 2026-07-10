@@ -1,122 +1,113 @@
 # ebay-best-offers
 
-Daily automation that closes out every pending eBay Best Offer across a fleet
-of seller accounts. It scrapes the seller-hub list, syncs the rows into SQL
-Server, refreshes a pricing workbook driven by Power Query, decides
-Accept / Counter / Remove for each offer against a configurable profit-margin
-rule, drives the browser to act on the decision, and emails an end-of-day
-summary. The interesting work is the **decision rule**, the
-**Python ↔ VBA boundary** that drives Excel without ever showing it, and the
-**resilient scraper** that survives eBay rendering screen-reader noise inline
-with the data.
+Daily automation that reviews every pending eBay Best Offer across a fleet of
+seller accounts and records a priced decision for each one. It reads the pricing
+rules from a staff-editable control workbook, scrapes each account's pending
+offers from Seller Hub, enriches every SKU with its cost and aged status from SQL
+Server, reads the buyer's offer, decides Accept / Counteroffer / Decline against a
+profit-margin rule, answers each offer on eBay through the Trading API, and writes
+the full result to a permanent SQL archive. It then refreshes a read-only report
+workbook and drafts an end-of-day summary email.
 
-## Daily flow
+The design is **SQL-first**: Python computes every number and stores it in
+`eBay.dbo.BestOffers`; the workbook and the email are read-only presentation
+layers. The interesting work is the **margin decision rule**, the **eBay Trading
+API** that both reads every buyer offer in one call (sidestepping eBay's bot
+challenge entirely) and sends each response, and the **idempotent, append-only
+archive** that never loses a day.
 
-1. **Scrape pending offers** — log into each seller account and scrape the seller-hub list of pending Best Offers.
-2. **Sync to SQL Server** — sync the scraped rows into SQL Server (`PendingOffers`).
-3. **Refresh pricing workbook** — refresh the pricing workbook synchronously via Power Query.
-4. **Decide per offer** — run the profit-margin decision rule to choose Accept / Counter / Remove for each offer.
-5. **Act in the browser** — drive the browser to act on each decision and write the outcome back to the sheet.
-6. **Email summary** — save the workbook and email an end-of-day per-account summary via Outlook.
+> **Status:** the acting step (Accept / Counter / Decline via the Trading API) is
+> built but **gated**. It is a dry run — it decides, records, and logs the response
+> it *would* send — until `ACT_ON_OFFERS=true` is set in the environment. That flag
+> is flipped only after the business signs off on the rules and buyer messages.
+
+## Daily flow (17:30, every day)
+
+1. **Read settings** from the control workbook (commission, the minimum profit
+   floors, counteroffer discount band, shipping floor). If a value is missing or out of
+   range, the run stops and emails the business team exactly what to fix, so no
+   offer is ever priced on a bad number.
+2. **Scrape pending offers** for each seller account from Seller Hub.
+3. **Enrich from SQL** — match each SKU to its site cost and aged status.
+4. **Read every buyer offer** in one eBay Trading API call (`GetBestOffers`) per
+   account — no page navigation, so eBay's bot check can't fire. The amounts are
+   matched onto the scraped rows by item number.
+5. **Decide** per offer: Accept, Counteroffer, or Decline, or a skip reason
+   (Expired Offer, Out of Stock, Missing Site Cost).
+6. **Answer** each offer on eBay (`RespondToBestOffer`) — Accept, send the
+   counteroffer with its buyer message, or Decline with its message. Gated behind
+   `ACT_ON_OFFERS`: off, it logs the intended action and sends nothing.
+7. **Record** the full row to `eBay.dbo.BestOffers` — the permanent archive.
+8. **Report** — refresh the read-only workbook and draft the summary email.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    sched[APScheduler<br/>17:30 daily] --> scrape
+    sched[APScheduler<br/>17:30 daily] --> settings
+    settings[Read control workbook] -->|invalid| stop[Email business team, stop]
+    settings -->|ok| loop
 
-    subgraph scrape[Scrape pending offers]
+    subgraph loop[Per account]
         direction TB
-        login[Login per account] --> grid[Read offers grid]
-        grid --> parse[_parse_offer_row]
+        login[Login] --> scrape[Scrape grid<br/>item / SKU / price]
+        scrape --> enrich[Enrich from SQL<br/>site cost + aged status]
+        enrich --> read[Read offers<br/>Trading API GetBestOffers]
+        read --> decide[decide_offer]
+        decide --> respond[Answer offer<br/>RespondToBestOffer<br/>gated by ACT_ON_OFFERS]
+        respond --> store[(eBay.dbo.BestOffers<br/>permanent archive)]
     end
 
-    parse --> db[(SQL Server<br/>PendingOffers)]
-    db --> wb
-
-    subgraph wb[Pending-Offers.xlsm — hidden]
-        direction TB
-        refresh[modUtilities.refresh<br/>sync Power Query] --> sort[modUtilities.sortCols]
-    end
-
-    sort --> decide
-
-    subgraph decide[Per-offer decision loop]
-        direction TB
-        read[Read row from sheet] --> rule[_decide_offer]
-        rule --> act[Drive browser:<br/>accept / counter]
-        act --> write[Write outcome to sheet]
-    end
-
-    write --> finalize[modUtilities.reorder<br/>save workbook]
-    finalize --> email[Outlook email<br/>per-account summary]
+    store --> report[Refresh report workbook +<br/>draft summary email]
 ```
 
 ## Decision rule
 
-`_decide_offer` is the heart of the script — a pure function from offer
-inputs to `(action, counteroffer_amount)`. For every offer it tests, in
-order:
+`decide_offer(cx_offer, current_price, site_cost, aged_status, sell_below_cost, settings)`
+is a pure function from the offer's numbers to `(action, counter_price, margin)`.
+For each offer it tests, in order:
 
-1. **Removed by Buyer** if the offer is missing, the SKU's site cost is the
-   sentinel `0` or `0.01`, or the SKU's brand is on the blocked-brands list.
-2. **Accept** if accepting the customer's offer would clear the profit
-   threshold (currently `≥ 11%` of the sale price after eBay's commission).
-3. **Counter at the floor** (`MAX_DISCOUNT × list_price`, e.g. 90% of list)
-   if the floor would clear the threshold but the ceiling would not.
-   *(Mathematically unreachable when commission is constant — preserved as a
-   rule rather than a behavior.)*
-4. **Counter at the ceiling** (`MIN_DISCOUNT × list_price`, e.g. 95% of list)
-   if the ceiling clears the threshold and the customer's offer does not.
-5. **Counter just below list** (`list_price − $0.01`) otherwise.
+1. **Expired Offer** — the buyer's offer is no longer readable.
+2. **Out of Stock** — the listing has no sellable quantity, so eBay would block an
+   Accept/Counter; the offer is recorded and shown but never answered.
+3. **Missing Site Cost** — the SKU has no cost in SQL (the `0` / `0.01` sentinel).
+4. **Accepted** — the buyer's own offer already clears the minimum profit floor.
+5. **Counteroffer** — the biggest discount within the allowed band that still
+   clears the floor (the best price for the buyer that still protects us).
+6. **Declined** — even the shallowest allowed discount can't clear the floor.
 
-#### Worked example
-
-List price `$200`, total cost `$150`, commission `9.1%`, MIN_DISCOUNT `0.95`,
-MAX_DISCOUNT `0.9`, threshold `11%`. A buyer offers `$160`:
-
-| Price tested        | Value | Profit % at that price | Branch result   |
-|---------------------|------:|-----------------------:|-----------------|
-| Customer's offer    | $160  |                   2.4% | not enough → ↓  |
-| Floor (90%)         | $180  |                   7.6% | not enough → ↓  |
-| Ceiling (95%)       | $190  |                  11.8% | clears → **counter at $190** |
-
-The script writes `Counteroffer / $190` to the sheet and drives the browser
-to submit it.
-
-## Performance notes
-
-The script's three slowest legs are Excel refresh, Excel cell I/O, and the
-browser scrape. This version tunes the first two:
-
-- **Synchronous query refresh.** `modUtilities.refresh` no longer calls
-  `ThisWorkbook.RefreshAll` (which dispatches every Power Query
-  asynchronously and returns immediately). It iterates each connection,
-  forces `BackgroundQuery = False`, and refreshes them in order. The Python
-  side drops two `time.sleep(5)` waits that previously covered the async
-  case.
-- **Excel runs hidden.** The script opens Excel via
-  `xl.App(visible=False, add_book=False)` and quits it in `finally`. No
-  flashing window, no stolen focus, safe for scheduled runs.
-- **Bulk column read.** `seller_automation_utils.custom_functions.first_empty_row` now
-  reads the column in one COM round-trip and scans in Python, instead of
-  one COM call per cell. The win scales with table size.
-- **VBA hardening.** `refresh`, `sortCols`, and `reorder` all run
-  inside `ScreenUpdating=False`, `Calculation=xlCalculationManual`,
-  `EnableEvents=False`, with `On Error GoTo Cleanup` blocks that restore
-  the Application state even on failure.
-
-The canonical VBA source lives in `vba/modUtilities.bas` so the macros are
-version-controlled alongside the Python.
-
-## Logging
+The **minimum profit floor is per-item**: the default, eased to a lower floor for
+Slow / Dead aged items or a SellBelowCost SKU (the lowest applicable wins), so
+flagged inventory can be countered deeper. Every threshold comes from the control
+workbook, never from the code.
 
 ```text
-21:03:43 INFO     Navigating to pending offers for AccountKeyA.
-21:03:51 INFO     Retrieving 23 out of 23 offers from eBay.
-21:04:09 INFO     Offer accepted at $190 (11.8% profit).
-21:04:14 INFO     Offer countered at $185.00 (price lowered by $0.01, 7.5% profit).
+margin      = (price - total_cost - price * commission) / price
+total_cost  = site_cost + est_shipping(site_cost)
+est_shipping = tiered 5% / 3% / 2% of the site cost, floored at the workbook's
+               "minimum estimated shipping"
 ```
+
+The est_shipping tiers are a pricing formula (code); its floor is a workbook value.
+
+## The permanent archive
+
+`eBay.dbo.BestOffers` is **append-only and never truncated** — every past day is
+kept. The report shows only today (its Power Query filters on `report_date`).
+Same-day reruns are idempotent per account: an account's not-yet-answered rows are
+replaced with the latest scrape, and an account whose offers were all answered is
+skipped. If one account fails mid-run, only that run's un-answered inserts are
+undone and a crash report is emailed, naming the account.
+
+## Settings (control workbook)
+
+Business users edit `Best-Offers-Settings.xlsx`, read with pandas (no Excel COM):
+commission; the minimum profit floors (default, Slow, Dead, sell-below-cost); the
+min/max counteroffer discount; and the minimum estimated shipping. Nothing
+business-tunable lives in code or environment variables. A missing or invalid value
+stops the run and sends a plain-language fix-it email.
+
+## Logging
 
 Configured once via the shared helper:
 
@@ -125,23 +116,25 @@ from seller_automation_utils.logging_utils import setup_logging
 log = setup_logging("ebay_best_offers")
 ```
 
-`setup_logging` wires a Rich console handler (colorized output, markup
-rendering, rich tracebacks) and a 1 MB rotating file handler writing to
-`logs/<name>.log`. Available to every automation that imports `seller_automation_utils`.
+A Rich console handler (colorized, rich tracebacks) plus a rotating file handler
+writing to `logs/ebay_best_offers.log`. A custom `SUCCESS` level marks milestones
+(`log.success(...)`).
 
 ## Project layout
 
 ```
 .
-├── run_ebay_best_offers.py   # the script — single file by design
+├── run_ebay_best_offers.py     # the automation — single file by design
 ├── vba/
-│   └── modUtilities.bas         # canonical source for the workbook's VBA
+│   └── modUtilities.bas        # canonical source for the report workbook's VBA
 ├── config/
-│   ├── accounts.json            # eBay profile names (gitignored)
-│   └── paths.json               # workbook & aged-inventory paths (gitignored)
-├── logs/                        # rotating logger output (gitignored)
+│   ├── accounts.json           # eBay profile names (gitignored; .example tracked)
+│   └── paths.json              # workbook & report paths (gitignored; .example tracked)
+├── tests/                      # pure-function branch tests (pytest)
+├── logs/  output/  downloaded_files/  screenshots/   # working dirs (.gitkeep only)
 ├── requirements.txt
-└── README.md
+├── README.md
+└── LICENSE
 ```
 
 ## Setup
@@ -164,11 +157,17 @@ copy config\accounts.json.example config\accounts.json
 copy config\paths.json.example config\paths.json
 ```
 
-Edit each file with real values — credentials, SQL table names, and offer thresholds in `.env`; eBay profiles and workbook paths in the two `config/*.json` files. All are gitignored.
+Edit each with real values: credentials and email addresses in `.env`; eBay
+profiles in `config\accounts.json`; workbook and report paths in
+`config\paths.json`. All three are gitignored.
 
-### 3. VBA module (one-time per workbook)
+### 3. Report workbook (one-time)
 
-`Pending-Offers.xlsm` must contain the canonical `modUtilities` from `vba/modUtilities.bas`. Open the workbook in Excel, press **Alt+F11**, insert a module named `modUtilities`, and paste the contents of `vba/modUtilities.bas`. Save the workbook.
+The report workbook (`Best-Offers.xlsm`, path in `config\paths.json`) holds one
+Power Query over `eBay.dbo.BestOffers` filtered to today, plus the `modUtilities`
+macros from `vba/modUtilities.bas` (a `refresh` that forces a synchronous query
+refresh). The script opens it hidden, refreshes it, saves, and attaches it — so
+keep the workbook **closed** while a run is in progress.
 
 ### 4. Run
 
@@ -176,29 +175,43 @@ Edit each file with real values — credentials, SQL table names, and offer thre
 .venv\Scripts\python run_ebay_best_offers.py
 ```
 
-The script prompts "Run now?" — answer **Y** to execute immediately, or **N** to register the APScheduler job and idle until the next **17:30 daily** trigger.
+Answer **Y** to run immediately, or **N** to register the APScheduler job and idle
+until the next **17:30 daily** trigger.
+
+### Tests
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1; .venv\Scripts\python -m pytest -q
+```
+
+(The env var sidesteps a seleniumbase pytest-plugin import that needs setuptools.)
 
 ## Environment variables
 
 | Variable | Description |
 |---|---|
-| `eBay_pass` | eBay account password |
-| `CHROME_USER_DATA_DIR` | Path to the Chrome automation profile directory |
-| `ALERT_EMAIL` | Outlook recipient for unhandled-exception crash reports |
-| `SENDER_EMAIL` | Outlook account used to send the report email |
-| `TO_EMAIL` | Comma-separated list of recipient email addresses |
-| `CC_EMAIL` | Comma-separated list of CC email addresses |
-| `DB_TABLE_PENDING` | SQL table for pending offers (default: `PendingOffers`) |
-| `DB_TABLE_AGED` | SQL table for aged inventory (default: `AgedInventory`) |
-| `EBAY_COMMISSION` | eBay fee rate as a decimal (default: `0.091`) |
-| `MIN_DISCOUNT` | Ceiling price as a fraction of list (default: `0.95`) |
-| `MAX_DISCOUNT` | Floor price as a fraction of list (default: `0.9`) |
-| `MIN_PROFIT` | Minimum profit margin (currently informational — code uses `0.11`) |
-| `BRANDS` | Comma-separated list of blocked brand names |
+| `CHROME_USER_DATA_DIR` | Path to the dedicated Chrome automation profile directory |
+| `eBay_pass` | eBay account password (browser grid scrape / login) |
+| `EBAY_APP_ID` / `EBAY_DEV_ID` / `EBAY_CERT_ID` | eBay Trading API app keyset (one app covers all accounts) |
+| `EBAY_AUTH_TOKEN_<ACCOUNT>` | Trading API user token per seller account (e.g. `EBAY_AUTH_TOKEN_ACCOUNT1`) |
+| `ACT_ON_OFFERS` | Safety gate. `false`/unset = dry run (decide + record, send nothing). `true` = answer offers on eBay for real |
+| `ALERT_EMAIL` | Outlook recipient for crash reports (screenshot + traceback) |
+| `SENDER_EMAIL` | Outlook account the summary email is sent from |
+| `TO_EMAIL` | Recipient(s) of the summary email, comma-separated |
+| `CC_EMAIL` | Optional CC recipient(s), comma-separated |
+| `REPORT_DRAFT_TO` | While paused, the report drafts here for review (default: `SENDER_EMAIL`) |
+| `SETTINGS_ALERT_TO` | Business recipient(s) of the settings fix-it email |
+| `SETTINGS_ALERT_BCC` | Optional BCC on the settings fix-it email |
+
+Business tunables (commission, profit floors, discount band, shipping floor) are
+**not** environment variables — they live in the control workbook.
 
 ## Author
 
-Built by **Brian Ramirez** ([@dominicci13](https://github.com/dominicci13)) — automation & AI workflow specialist. More on my [GitHub profile](https://github.com/dominicci13) and [LinkedIn](https://linkedin.com/in/bdramirez).
+Built by **Brian Ramírez** ([@dominicci13](https://github.com/dominicci13)),
+automation & AI workflow specialist. More on my
+[GitHub profile](https://github.com/dominicci13) and
+[LinkedIn](https://linkedin.com/in/bdramirez).
 
 ## License
 
