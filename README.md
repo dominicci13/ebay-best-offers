@@ -7,7 +7,7 @@ offers from Seller Hub, enriches every SKU with its cost and aged status from SQ
 Server, reads the buyer's offer, decides Accept / Counteroffer / Decline against a
 profit-margin rule, answers each offer on eBay through the Trading API, and writes
 the full result to a permanent SQL archive. It then refreshes a read-only report
-workbook and drafts an end-of-day summary email.
+workbook and sends an end-of-day summary email.
 
 The design is **SQL-first**: Python computes every number and stores it in
 `eBay.dbo.BestOffers`; the workbook and the email are read-only presentation
@@ -38,7 +38,7 @@ archive** that never loses a day.
    counteroffer with its buyer message, or Decline with its message. Gated behind
    `ACT_ON_OFFERS`: off, it logs the intended action and sends nothing.
 7. **Record** the full row to `eBay.dbo.BestOffers` — the permanent archive.
-8. **Report** — refresh the read-only workbook and draft the summary email.
+8. **Report** — refresh the read-only workbook and send the summary email.
 
 ## Architecture
 
@@ -58,7 +58,7 @@ flowchart LR
         respond --> store[(eBay.dbo.BestOffers<br/>permanent archive)]
     end
 
-    store --> report[Refresh report workbook +<br/>draft summary email]
+    store --> report[Refresh report workbook +<br/>send summary email]
 ```
 
 ## Decision rule
@@ -197,9 +197,8 @@ $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1; .venv\Scripts\python -m pytest -q
 | `ACT_ON_OFFERS` | Safety gate. `false`/unset = dry run (decide + record, send nothing). `true` = answer offers on eBay for real |
 | `ALERT_EMAIL` | Outlook recipient for crash reports (screenshot + traceback) |
 | `SENDER_EMAIL` | Outlook account the summary email is sent from |
-| `TO_EMAIL` | Recipient(s) of the summary email, comma-separated |
+| `TO_EMAIL` | Recipient(s) of the summary email, comma-separated (default: `SENDER_EMAIL`) |
 | `CC_EMAIL` | Optional CC recipient(s), comma-separated |
-| `REPORT_DRAFT_TO` | While paused, the report drafts here for review (default: `SENDER_EMAIL`) |
 | `SETTINGS_ALERT_TO` | Business recipient(s) of the settings fix-it email |
 | `SETTINGS_ALERT_BCC` | Optional BCC on the settings fix-it email |
 

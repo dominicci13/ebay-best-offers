@@ -12,7 +12,7 @@ Runs once a day at 17:30 local time. Each run:
 3. Decides Accept / Counteroffer / Decline (or skips) per offer.    [Step 2]
 4. Answers each offer (Accept / Counter / Decline) via RespondToBestOffer when
    ACT_ON_OFFERS is enabled; otherwise a dry run just logs the intent.  [Step 6]
-5. Writes the full result set to SQL and drafts a summary email with the
+5. Writes the full result set to SQL and sends a summary email with the
    read-only report workbook attached.                               [Step 5]
 
 Import-safe: the prompt and the scheduler run only under
@@ -974,8 +974,8 @@ def remove_run_results(conn: object, accounts: list[str], today: str) -> None:
 # =============================================================================
 # The workbook is a read-only view (a Power Query over today's BestOffers rows);
 # the script only refreshes it, never writes cells. The email summary is built
-# straight from the in-memory results. While the automation is paused it is
-# drafted (opened, not sent) for review. Rates/brands come from `settings`.
+# straight from the in-memory results and sent to the stakeholders with the
+# refreshed workbook attached. Rates/brands come from `settings`.
 
 REPORT_ACTIONS = [
     "Accepted", "Counteroffer", "Declined",
@@ -1079,14 +1079,13 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
     return f"<div>{intro}{title}{table}{footer}{closing}</div>"
 
 
-def draft_summary_email(results: pd.DataFrame, settings: dict, workbook_path: str | None) -> None:
-    """Refresh the report workbook and draft the summary email for review.
+def send_summary_email(results: pd.DataFrame, settings: dict, workbook_path: str | None) -> None:
+    """Refresh the report workbook and send the summary email to the stakeholders.
 
-    The automation is paused, so the email is drafted (opened in Outlook, not
-    sent). The refreshed workbook is attached. A refresh failure is logged and the
-    draft is still created — the SQL archive is the source of truth; the workbook
-    is only a view. Recipients default to the sender (draft to Brian) via
-    ``REPORT_DRAFT_TO``; switch to the stakeholder list and ``send=True`` when live.
+    The refreshed workbook is attached. A refresh failure is logged and the email
+    is still sent — the SQL archive is the source of truth; the workbook is only a
+    view. Recipients come from ``TO_EMAIL`` (falling back to ``SENDER_EMAIL`` if
+    unset) with ``CC_EMAIL`` copied.
 
     Args:
         results: Today's combined result rows.
@@ -1097,21 +1096,23 @@ def draft_summary_email(results: pd.DataFrame, settings: dict, workbook_path: st
         try:
             excel_utils.refresh_workbook(workbook_path)
         except Exception:
-            log.error("Could not refresh the report workbook — drafting the email without a fresh refresh.")
+            log.error("Could not refresh the report workbook — sending the email without a fresh refresh.")
             traceback.print_exc()
 
-    report_to = _split_emails(get_env("REPORT_DRAFT_TO", default="")) or [get_env("SENDER_EMAIL", required=True)]
+    report_to = _split_emails(get_env("TO_EMAIL", default="")) or [get_env("SENDER_EMAIL", required=True)]
+    report_cc = _split_emails(get_env("CC_EMAIL", default="")) or None
     attachments = [workbook_path] if workbook_path and Path(workbook_path).exists() else None
     send_email(
         account=get_env("SENDER_EMAIL", required=True),
-        subject=f"eBay Report - Best Offers - {datetime.now().strftime('%m/%d/%Y')}",  # fleet convention
+        subject=f"eBay Report - Best Offers - {datetime.now().strftime('%m/%d/%Y')}",
         body=build_summary_email(results, settings),
         to=report_to,
+        cc=report_cc,
         attachments=attachments,
-        show=True,   # open the draft for review
-        send=True,  # paused — never auto-send
+        show=True,
+        send=True,
     )
-    log.success("Summary email drafted for review.")
+    log.success(f"Summary email sent to {', '.join(report_to)}.")
 
 
 # =============================================================================
@@ -1124,7 +1125,7 @@ def main() -> None:
     Settings are read first: if the workbook has a problem, email the business
     team and stop before any browser or database work. Then each account is
     scraped, enriched, decided, answered on eBay, and archived to SQL, and a
-    summary email is drafted. Answering is gated behind ``ACT_ON_OFFERS``: with the
+    summary email is sent. Answering is gated behind ``ACT_ON_OFFERS``: with the
     flag off the run is a dry run that records decisions but sends nothing.
     """
     load_dotenv()
@@ -1250,12 +1251,12 @@ def main() -> None:
         if ebay_conn is not None:
             ebay_conn.close()
 
-    # Refresh the report workbook and draft the summary email for review. Non-fatal:
+    # Refresh the report workbook and send the summary email. Non-fatal:
     # today's results are already stored, so a workbook or email hiccup must not fail
     # the run or roll back the archive.
     if all_results:
         try:
-            draft_summary_email(pd.concat(all_results, ignore_index=True), settings, paths.get("report_wb_path"))
+            send_summary_email(pd.concat(all_results, ignore_index=True), settings, paths.get("report_wb_path"))
         except Exception:
             log.error("Report/email step failed — today's results are safely stored in SQL.")
             traceback.print_exc()
