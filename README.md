@@ -77,7 +77,7 @@ For each offer it tests, in order:
 6. **Declined** — even the shallowest allowed discount can't clear the floor.
 
 The **minimum profit floor is per-item**: the default, eased to a lower floor for
-Slow / Dead aged items or a SellBelowCost SKU (the lowest applicable wins), so
+Slow / Dead aged items or an EnableSellingBelowCost SKU (the lowest applicable wins), so
 flagged inventory can be countered deeper. Every threshold comes from the control
 workbook, never from the code.
 

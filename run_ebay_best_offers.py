@@ -308,12 +308,12 @@ def load_reference_data(conn: object) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read the site-cost and aged-status reference tables from the Reports database.
 
     Two plain SELECTs, kept to one row per SKU:
-      - ``SellerCloud``   -> the SKU's site cost and its SellBelowCost flag
+      - ``SellerCloud``   -> the SKU's site cost and its EnableSellingBelowCost flag
       - ``AgedInventory`` -> the SKU's aged status (e.g. Dead / Slow)
 
-    ``SellBelowCost`` is optional: the SellerCloud sync may not have added the
+    ``EnableSellingBelowCost`` is optional: the SellerCloud sync may not have added the
     column yet. If it's absent we still run — every SKU is treated as not
-    sell-below-cost, so the 4% floor stays dormant — and the script picks the flag
+    enable-selling-below-cost, so the 4% floor stays dormant — and the script picks the flag
     up automatically the next run after the column exists and is populated. A dropped
     column can therefore never crash the run.
 
@@ -333,14 +333,14 @@ def load_reference_data(conn: object) -> tuple[pd.DataFrame, pd.DataFrame]:
     probe = conn.cursor()
     probe.execute(
         "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
-        "WHERE TABLE_NAME = 'SellerCloud' AND COLUMN_NAME = 'SellBelowCost'"
+        "WHERE TABLE_NAME = 'SellerCloud' AND COLUMN_NAME = 'EnableSellingBelowCost'"
     )
     if probe.fetchone() is not None:
-        site_costs = read("SELECT SKU, SiteCost, SellBelowCost FROM dbo.SellerCloud",
+        site_costs = read("SELECT SKU, SiteCost, EnableSellingBelowCost FROM dbo.SellerCloud",
                           ["sku", "site_cost", "sell_below_cost"])
     else:
-        log.warning("SellerCloud.SellBelowCost not found — treating every SKU as not "
-                    "sell-below-cost until the column exists and is populated.")
+        log.warning("SellerCloud.EnableSellingBelowCost not found — treating every SKU as not "
+                    "enable-selling-below-cost until the column exists and is populated.")
         site_costs = read("SELECT SKU, SiteCost FROM dbo.SellerCloud", ["sku", "site_cost"])
         site_costs["sell_below_cost"] = False
 
@@ -354,7 +354,7 @@ def enrich_offers(offers: pd.DataFrame, site_costs: pd.DataFrame, aged: pd.DataF
     Pure (no database) so it is easy to test. A SKU with no site-cost row gets
     0 — the decision treats 0 (and 0.01) as "cost unknown" and skips it rather
     than risk a bad counteroffer. A SKU with no aged row gets "N/A"; a SKU with no
-    (or NULL) SellBelowCost flag is treated as False.
+    (or NULL) EnableSellingBelowCost flag is treated as False.
 
     Args:
         offers: The scraped offers table (see :func:`offers_to_frame`).
@@ -423,7 +423,7 @@ def upload_aged_inventory(aged_inv_path: str, today: str) -> None:
 # =============================================================================
 # Pure functions from the offer numbers to an action — no browser, no database,
 # so every branch is easy to test. Counter with the biggest discount in the
-# allowed band that still clears the minimum profit (aged / SellBelowCost items
+# allowed band that still clears the minimum profit (aged / EnableSellingBelowCost items
 # ease that floor) — the best price for the buyer that still protects us.
 
 def est_shipping(site_cost: float, floor: float) -> float:
@@ -455,7 +455,7 @@ def effective_min_profit(aged_status: str, sell_below_cost: bool, settings: dict
     """The lowest minimum-profit floor that applies to one item.
 
     Starts at the default and eases to the more permissive floor for a Slow / Dead
-    aged item or a SellBelowCost SKU, so flagged inventory can be countered deeper.
+    aged item or a EnableSellingBelowCost SKU, so flagged inventory can be countered deeper.
     When several apply, the lowest (most permissive) wins. All floors come from the
     settings workbook.
     """
@@ -480,7 +480,7 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
         current_price: Our current list price.
         site_cost: The SKU's site cost (0 or 0.01 means "cost unknown").
         aged_status: The SKU's aged status ("Slow" / "Dead" ease the min profit).
-        sell_below_cost: The SKU's SellBelowCost flag (also eases the min profit).
+        sell_below_cost: The SKU's EnableSellingBelowCost flag (also eases the min profit).
         settings: The control-workbook settings.
         out_of_stock: The listing has no sellable quantity — eBay blocks Accept and
             Counter on it, so we skip it rather than send a doomed response.
@@ -1062,7 +1062,7 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
         "<p style='font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#555'>"
         f"Rules used: commission {settings['commission']:.1%}; minimum profit {settings['min_profit']:.1%} "
         f"(Slow {settings['slow_min_profit']:.1%}, Dead {settings['dead_min_profit']:.1%}, "
-        f"sell-below-cost {settings['sell_below_cost_min_profit']:.1%}); counter discount band "
+        f"enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%}); counter discount band "
         f"{settings['min_discount']:.0%} to {settings['max_discount']:.0%}; estimated shipping floor "
         f"${settings['shipping_floor']:,.2f}.</p>"
     )
@@ -1112,7 +1112,7 @@ def send_summary_email(results: pd.DataFrame, settings: dict, workbook_path: str
         show=True,
         send=True,
     )
-    log.success(f"Summary email sent to {', '.join(report_to)}.")
+    log.success("Summary email sent.")
 
 
 # =============================================================================
@@ -1148,7 +1148,7 @@ def main() -> None:
     log.success(
         f"Settings loaded — commission {settings['commission']:.1%}, "
         f"min profit {settings['min_profit']:.1%} (Slow {settings['slow_min_profit']:.1%}, "
-        f"Dead {settings['dead_min_profit']:.1%}, sell-below-cost {settings['sell_below_cost_min_profit']:.1%}), "
+        f"Dead {settings['dead_min_profit']:.1%}, enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%}), "
         f"discount band {settings['min_discount']:.0%}-{settings['max_discount']:.0%}, "
         f"shipping floor ${settings['shipping_floor']:,.2f}."
     )
