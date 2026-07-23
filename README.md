@@ -16,10 +16,10 @@ API** that both reads every buyer offer in one call (sidestepping eBay's bot
 challenge entirely) and sends each response, and the **idempotent, append-only
 archive** that never loses a day.
 
-> **Status:** the acting step (Accept / Counter / Decline via the Trading API) is
-> built but **gated**. It is a dry run — it decides, records, and logs the response
-> it *would* send — until `ACT_ON_OFFERS=true` is set in the environment. That flag
-> is flipped only after the business signs off on the rules and buyer messages.
+> **Status:** **live.** `ACT_ON_OFFERS=true` — the acting step (Accept / Counter /
+> Decline via the Trading API) answers real buyer offers (live since 2026-07-10).
+> Setting `ACT_ON_OFFERS=false` returns it to a dry run: it decides, records, and logs
+> the response it *would* send, sending nothing.
 
 ## Daily flow (17:30, every day)
 
