@@ -12,9 +12,9 @@ workbook and sends an end-of-day summary email.
 The design is **SQL-first**: Python computes every number and stores it in
 `eBay.dbo.BestOffers`; the workbook and the email are read-only presentation
 layers. The interesting work is the **margin decision rule**, the **eBay Trading
-API** that both reads every buyer offer in one call (sidestepping eBay's bot
-challenge entirely) and sends each response, and the **idempotent, append-only
-archive** that never loses a day.
+API** that both reads every buyer offer (paging through all results, sidestepping
+eBay's bot challenge entirely) and sends each response, and the **idempotent,
+append-only archive** that never loses a day.
 
 > **Status:** **live.** `ACT_ON_OFFERS=true` — the acting step (Accept / Counter /
 > Decline via the Trading API) answers real buyer offers (live since 2026-07-10).
@@ -29,9 +29,10 @@ archive** that never loses a day.
    offer is ever priced on a bad number.
 2. **Scrape pending offers** for each seller account from Seller Hub.
 3. **Enrich from SQL** — match each SKU to its site cost and aged status.
-4. **Read every buyer offer** in one eBay Trading API call (`GetBestOffers`) per
-   account — no page navigation, so eBay's bot check can't fire. The amounts are
-   matched onto the scraped rows by item number.
+4. **Read every buyer offer** from the eBay Trading API (`GetBestOffers`, paging
+   through all results) per account — no browser, so eBay's bot check can't fire.
+   Offers are matched onto the scraped rows by item number, one row per offer, so a
+   listing with several offers has all of them handled.
 5. **Decide** per offer: Accept, Counteroffer, or Decline, or a skip reason
    (Expired Offer, Out of Stock, Missing Site Cost).
 6. **Answer** each offer on eBay (`RespondToBestOffer`) — Accept, send the

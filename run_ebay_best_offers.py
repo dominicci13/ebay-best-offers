@@ -3,12 +3,12 @@
 Runs once a day at 17:30 local time. Each run:
 
 1. Reads the pricing settings (commission, minimum profit floors, counteroffer
-   discount band, shipping floor) from the control workbook. If a setting is
-   missing or invalid, the run stops and emails the business team what to fix,
-   so no offer is ever sent using a wrong number.
+   discount band) from the control workbook. If a setting is missing or invalid,
+   the run stops and emails the business team what to fix, so no offer is ever
+   sent using a wrong number.
 2. Scrapes each seller account's pending Best Offers (Seller Hub grid), reads
-   every buyer offer in one eBay Trading API call (GetBestOffers), and enriches
-   from SQL (site cost, aged status).                               [Step 3]
+   every buyer offer from the eBay Trading API (GetBestOffers, across all pages),
+   and enriches from SQL (site cost, weight, aged status).          [Step 3]
 3. Decides Accept / Counteroffer / Decline (or skips) per offer.    [Step 2]
 4. Answers each offer (Accept / Counter / Decline) via RespondToBestOffer when
    ACT_ON_OFFERS is enabled; otherwise a dry run just logs the intent.  [Step 6]
@@ -554,11 +554,13 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
 # =============================================================================
 # READ OFFERS via the eBay Trading API (GetBestOffers)                 [Step 3]
 # =============================================================================
-# One GetBestOffers call returns every active best offer for an account (item,
-# amount, BestOfferID) — no page navigation, so eBay's bot check never fires. This
-# replaces the old per-item browser read. Good candidate to promote into
-# seller_automation_utils. Buyer identity in the response is intentionally never
-# parsed/stored (keeps our Marketplace-Account-Deletion exemption valid).
+# GetBestOffers returns every active best offer for an account (item, amount,
+# BestOfferID); we page through all results because eBay caps the page size, so
+# reading only page 1 would silently drop later offers. It's a server API with no
+# browser, so eBay's bot check never fires. This replaces the old per-item browser
+# read. Good candidate to promote into seller_automation_utils. Buyer identity in
+# the response is intentionally never parsed/stored (keeps our
+# Marketplace-Account-Deletion exemption valid).
 
 TRADING_ENDPOINT = "https://api.ebay.com/ws/api.dll"
 TRADING_COMPAT_LEVEL = "1193"
@@ -1299,7 +1301,7 @@ def main() -> None:
                 offers = scrape_pending_offers(driver, account, today)
                 offers = enrich_offers(offers, site_costs, aged)
 
-                # Read every buyer offer in one Trading API call — no page navigation,
+                # Read every buyer offer from the Trading API (all pages) — no browser,
                 # so eBay's bot check never fires. A listing can have several offers, so
                 # attach_api_offers expands to one row per offer. A grid item with no
                 # active offer becomes one row with cx_offer 0 -> Expired Offer.
