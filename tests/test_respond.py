@@ -9,30 +9,23 @@ import pandas as pd
 
 import run_ebay_best_offers as script
 
-# item_number -> offer dict as get_best_offers() returns it (carries the id + qty).
-API_BY_ITEM = {
-    "111": {"item_number": "111", "best_offer_id": "b-accept", "quantity": 1},
-    "222": {"item_number": "222", "best_offer_id": "b-counter", "quantity": 3},
-    "333": {"item_number": "333", "best_offer_id": "b-decline", "quantity": 1},
-    "444": {"item_number": "444", "best_offer_id": "b-expired", "quantity": 1},
-    "555": {"item_number": "555", "best_offer_id": None, "quantity": 1},   # no live id
-}
-
 SETTINGS = {"commission": 0.12, "min_discount": 0.05, "max_discount": 0.10}
 
-# One row per action, incl. a skip reason (Expired) and a missing-id counter. The
-# extra numeric columns feed the per-offer log line (_offer_log_line).
+# One row per offer, incl. a skip reason (Expired) and a missing-id counter. Each
+# row carries its best_offer_id + offer_quantity (what respond_to_offers reads) plus
+# the numeric columns that feed the per-offer log line (_offer_log_line).
 RESULTS = pd.DataFrame(
     [
-        # account, item, action, cx_offer, current_price, counter, counter_margin, buyer_margin, total_cost
-        ("Account1", "111", "Accepted",      95.00, 100.00,   None,  None, 0.10, 80.00),
-        ("Account1", "222", "Counteroffer", 150.00, 200.00, 192.39, 0.09,  None, 120.00),
-        ("Account1", "333", "Declined",      50.00, 100.00,   None,  None, None, 90.00),
-        ("Account1", "444", "Expired Offer",  0.00,  50.00,   None,  None, None, 40.00),
-        ("Account1", "555", "Counteroffer",  80.00, 120.00,  88.00, 0.09,  None, 70.00),
+        # account, item, action, cx_offer, current_price, counter, counter_margin, buyer_margin, total_cost, best_offer_id, offer_quantity
+        ("Acct1", "111", "Accepted",      95.00, 100.00,   None,  None, 0.10, 80.00,  "b-accept",  1),
+        ("Acct1", "222", "Counteroffer", 150.00, 200.00, 192.39, 0.09,  None, 120.00, "b-counter", 3),
+        ("Acct1", "333", "Declined",      50.00, 100.00,   None,  None, None, 90.00,  "b-decline", 1),
+        ("Acct1", "444", "Expired Offer",  0.00,  50.00,   None,  None, None, 40.00,  "b-expired", 1),
+        ("Acct1", "555", "Counteroffer",  80.00, 120.00,  88.00, 0.09,  None, 70.00,  None,        1),
     ],
     columns=["account", "item_number", "action", "cx_offer", "current_price",
-             "counter", "counter_margin", "buyer_margin", "total_cost"],
+             "counter", "counter_margin", "buyer_margin", "total_cost",
+             "best_offer_id", "offer_quantity"],
 )
 
 
@@ -116,7 +109,7 @@ def test_dry_run_sends_nothing(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("respond_to_best_offer must not be called in a dry run")
     monkeypatch.setattr(script, "respond_to_best_offer", boom)
-    acted = script.respond_to_offers(RESULTS, API_BY_ITEM, "TKN", SETTINGS, live=False)
+    acted = script.respond_to_offers(RESULTS, "TKN", SETTINGS, live=False)
     assert acted == {}                                 # nothing answered, nothing stamped
 
 
@@ -129,10 +122,10 @@ def test_live_maps_actions_and_skips_non_actionable(monkeypatch):
         return {"ack": "Success", "errors": []}
 
     monkeypatch.setattr(script, "respond_to_best_offer", fake)
-    acted = script.respond_to_offers(RESULTS, API_BY_ITEM, "TKN", SETTINGS, live=True)
+    acted = script.respond_to_offers(RESULTS, "TKN", SETTINGS, live=True)
 
     # Accept, Counter, Decline answered; Expired skipped; missing-id counter skipped.
-    assert set(acted) == {"111", "222", "333"}
+    assert set(acted) == {"b-accept", "b-counter", "b-decline"}   # stamped by BestOfferID
     sent = {c["item"]: c for c in calls}
     assert set(sent) == {"111", "222", "333"}
     assert sent["111"]["action"] == "Accept" and sent["111"]["price"] is None and sent["111"]["msg"] is None
@@ -147,8 +140,29 @@ def test_live_bad_ack_is_not_stamped(monkeypatch):
     def fake(*a, **k):
         return {"ack": "Failure", "errors": ["21916: Best Offer no longer available."]}
     monkeypatch.setattr(script, "respond_to_best_offer", fake)
-    acted = script.respond_to_offers(RESULTS, API_BY_ITEM, "TKN", SETTINGS, live=True)
+    acted = script.respond_to_offers(RESULTS, "TKN", SETTINGS, live=True)
     assert acted == {}                                 # a rejected offer is never marked answered
+
+
+def test_two_offers_on_one_item_are_both_answered(monkeypatch):
+    """A listing with two buyer offers answers both, not just one (the multi-offer fix)."""
+    calls = []
+
+    def fake(token, item_id, best_offer_id, action, counter_price=None, counter_quantity=1, message=None):
+        calls.append(best_offer_id)
+        return {"ack": "Success", "errors": []}
+
+    monkeypatch.setattr(script, "respond_to_best_offer", fake)
+    two = pd.DataFrame(
+        [
+            ("Acct1", "900", "Counteroffer", 50.0, 100.0, 92.0, 0.09, None, 70.0, "boid-A", 1),
+            ("Acct1", "900", "Declined",     30.0, 100.0, None, None, None, 90.0, "boid-B", 1),
+        ],
+        columns=RESULTS.columns,
+    )
+    acted = script.respond_to_offers(two, "TKN", SETTINGS, live=True)
+    assert set(acted) == {"boid-A", "boid-B"}          # both offers on item 900 answered
+    assert calls == ["boid-A", "boid-B"]
 
 
 # --- _offer_log_line (the per-offer log wording) -----------------------------

@@ -24,7 +24,7 @@ archive** that never loses a day.
 ## Daily flow (17:30, every day)
 
 1. **Read settings** from the control workbook (commission, the minimum profit
-   floors, counteroffer discount band, shipping floor). If a value is missing or out of
+   floors, counteroffer discount band). If a value is missing or out of
    range, the run stops and emails the business team exactly what to fix, so no
    offer is ever priced on a bad number.
 2. **Scrape pending offers** for each seller account from Seller Hub.
@@ -83,12 +83,13 @@ workbook, never from the code.
 
 ```text
 margin      = (price - total_cost - price * commission) / price
-total_cost  = site_cost + est_shipping(site_cost)
-est_shipping = tiered 5% / 3% / 2% of the site cost, floored at the workbook's
-               "minimum estimated shipping"
+total_cost  = site_cost + est_shipping(weight_oz)
+est_shipping = a fixed dollar amount per weight tier (item weight from SellerCloud),
+               e.g. <=1 lb $8, 2-3 lb $10, 11-20 lb $20, >100 lb $100; a zero or
+               missing weight uses the lowest ("incorrect weight") tier at $15
 ```
 
-The est_shipping tiers are a pricing formula (code); its floor is a workbook value.
+The est_shipping weight tiers are a pricing table in code (`SHIPPING_TIERS`).
 
 ## The permanent archive
 
@@ -102,9 +103,10 @@ undone and a crash report is emailed, naming the account.
 ## Settings (control workbook)
 
 Business users edit `Best-Offers-Settings.xlsx`, read with pandas (no Excel COM):
-commission; the minimum profit floors (default, Slow, Dead, sell-below-cost); the
-min/max counteroffer discount; and the minimum estimated shipping. Nothing
-business-tunable lives in code or environment variables. A missing or invalid value
+commission; the minimum profit floors (default, Slow, Dead, sell-below-cost); and the
+min/max counteroffer discount. Shipping is estimated from each item's weight, so it
+is not a workbook value. Nothing else business-tunable lives in code or environment
+variables. A missing or invalid value
 stops the run and sends a plain-language fix-it email.
 
 ## Logging
@@ -202,8 +204,9 @@ $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1; .venv\Scripts\python -m pytest -q
 | `SETTINGS_ALERT_TO` | Business recipient(s) of the settings fix-it email |
 | `SETTINGS_ALERT_BCC` | Optional BCC on the settings fix-it email |
 
-Business tunables (commission, profit floors, discount band, shipping floor) are
-**not** environment variables — they live in the control workbook.
+Business tunables (commission, profit floors, discount band) are
+**not** environment variables — they live in the control workbook. Shipping is
+estimated from each item's weight (see the pricing rules above).
 
 ## Author
 

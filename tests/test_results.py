@@ -20,27 +20,28 @@ SETTINGS = {
     "shipping_floor": 12.0,
 }
 
-# One row per outcome. Columns match an enriched offer with cx_offer attached.
+# One row per outcome. Columns match an enriched offer with the API offer attached.
 OFFERS = pd.DataFrame(
     [
-        # date, account, title, sku, current_price, item_number, out_of_stock, site_cost, aged_status, cx_offer, sell_below_cost
-        ("2026-07-02", "Account1", "Cold CS-22C",  "CS-22C", 109.99, "111", False, 69.17, "N/A", 90.0, False),    # counter
-        ("2026-07-02", "Account1", "Sony A7",      "SNY",    250.00, "222", False, 100.00, "Slow", 200.0, False),  # accept
-        ("2026-07-02", "Account1", "Kodak EKMSD",  "EKMSD",  24.29,  "333", False, 35.64, "N/A", 20.0, False),     # decline
-        ("2026-07-02", "Account1", "Sony Expired", "SZ",     100.00, "444", True,  50.00, "N/A", 0.0, False),      # expired
-        ("2026-07-02", "Account1", "Sony NoCost",  "SQ",     100.00, "555", False, 0.00,  "N/A", 80.0, False),     # missing cost
-        ("2026-07-02", "Account1", "Dead Item",    "DED",    3849.0, "666", False, 2800.0, "Dead", 3500.0, False), # dead accepts
-        ("2026-07-02", "Account1", "OOS Item",     "OOS",    200.00, "777", True,  120.00, "N/A", 150.0, False),   # out of stock
+        # date, account, title, sku, current_price, item_number, out_of_stock, site_cost, weight_oz, aged_status, cx_offer, sell_below_cost, best_offer_id, offer_quantity
+        ("2026-07-02", "Acct1", "Cold CS-22C",  "CS-22C", 109.99, "111", False, 69.17, 40.0, "N/A", 90.0, False, "b-111", 1),    # counter
+        ("2026-07-02", "Acct1", "Sony A7",      "SNY",    250.00, "222", False, 100.00, 32.0, "Slow", 200.0, False, "b-222", 1), # accept
+        ("2026-07-02", "Acct1", "Kodak EKMSD",  "EKMSD",  24.29,  "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1),    # decline
+        ("2026-07-02", "Acct1", "Sony Expired", "SZ",     100.00, "444", True,  50.00, 40.0, "N/A", 0.0, False, None, 1),        # expired
+        ("2026-07-02", "Acct1", "Sony NoCost",  "SQ",     100.00, "555", False, 0.00,  40.0, "N/A", 80.0, False, "b-555", 1),    # missing cost
+        ("2026-07-02", "Acct1", "Dead Item",    "DED",    3849.0, "666", False, 2800.0, 640.0, "Dead", 3500.0, False, "b-666", 1), # dead accepts
+        ("2026-07-02", "Acct1", "OOS Item",     "OOS",    200.00, "777", True,  120.00, 40.0, "N/A", 150.0, False, "b-777", 1),  # out of stock
     ],
     columns=["date", "account", "title", "sku", "current_price", "item_number",
-             "out_of_stock", "site_cost", "aged_status", "cx_offer", "sell_below_cost"],
+             "out_of_stock", "site_cost", "weight_oz", "aged_status", "cx_offer",
+             "sell_below_cost", "best_offer_id", "offer_quantity"],
 )
 
 
 def _by_item():
     """Run build_results and index the rows by item_number for easy assertions."""
     result = script.build_results(OFFERS, SETTINGS)
-    assert list(result.columns) == script.RESULT_COLUMNS
+    assert list(result.columns) == script.RESULT_COLUMNS + ["best_offer_id", "offer_quantity"]
     return {row.item_number: row for row in result.itertuples(index=False)}
 
 
@@ -108,6 +109,40 @@ def test_dead_item_accepts_below_default_margin():
 
 def test_computed_costs_match_helpers():
     row = _by_item()["111"]
-    floor = SETTINGS["shipping_floor"]
-    assert row.est_shipping == script.est_shipping(69.17, floor)      # tiered on site cost
-    assert row.total_cost == round(69.17 + script.est_shipping(69.17, floor), 2)
+    assert row.est_shipping == script.est_shipping(40.0)             # keyed on weight (40 oz)
+    assert row.total_cost == round(69.17 + script.est_shipping(40.0), 2)
+
+
+# --- attach_api_offers (one row per offer) -----------------------------------
+
+_GRID_COLS = ["date", "account", "title", "sku", "current_price", "item_number",
+              "out_of_stock", "site_cost", "weight_oz", "aged_status", "sell_below_cost"]
+
+
+def test_attach_api_offers_expands_multiple_offers_per_item():
+    grid = pd.DataFrame(
+        [("2026-07-02", "Acct1", "Multi", "SKU-M", 100.00, "900", False, 50.0, 40.0, "N/A", False)],
+        columns=_GRID_COLS,
+    )
+    api_offers = [
+        {"item_number": "900", "cx_offer": 80.0, "best_offer_id": "A", "quantity": 1},
+        {"item_number": "900", "cx_offer": 60.0, "best_offer_id": "B", "quantity": 2},
+    ]
+    out = script.attach_api_offers(grid, api_offers)
+    assert len(out) == 2                                  # one row per offer, not one per item
+    assert set(out["best_offer_id"]) == {"A", "B"}
+    assert sorted(out["cx_offer"]) == [60.0, 80.0]
+    assert set(out["offer_quantity"]) == {1, 2}
+
+
+def test_attach_api_offers_no_offer_reads_as_expired():
+    grid = pd.DataFrame(
+        [("2026-07-02", "Acct1", "None", "SKU-N", 100.00, "901", False, 50.0, 40.0, "N/A", False)],
+        columns=_GRID_COLS,
+    )
+    out = script.attach_api_offers(grid, [])
+    assert len(out) == 1
+    assert out.iloc[0]["cx_offer"] == 0.0
+    assert out.iloc[0]["best_offer_id"] is None
+    result = script.build_results(out, SETTINGS)
+    assert result.iloc[0]["action"] == "Expired Offer"

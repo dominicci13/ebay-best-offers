@@ -15,13 +15,17 @@ SETTINGS = {
 }
 
 
-def test_est_shipping_tiers_and_floor():
-    # rate is tiered on the SITE COST now, floored at the workbook value
-    assert script.est_shipping(100, 12) == 12.0    # 5% of 100 = 5 -> floored to 12
-    assert script.est_shipping(500, 12) == 25.0    # 5% of 500
-    assert script.est_shipping(1500, 12) == 45.0   # 3% of 1500
-    assert script.est_shipping(3000, 12) == 60.0   # 2% of 3000
-    assert script.est_shipping(100, 8) == 8.0      # the floor is a parameter
+def test_est_shipping_weight_tiers():
+    # shipping is keyed on total weight in ounces (lbs*16 + oz)
+    assert script.est_shipping(0) == 15.0      # missing/zero weight -> bad-weight rate
+    assert script.est_shipping(1) == 15.0      # <= 1 oz
+    assert script.est_shipping(16) == 8.0      # 1 lb
+    assert script.est_shipping(24) == 10.0     # 1.5 lb rounds up into the 2-3 lb tier
+    assert script.est_shipping(48) == 10.0     # 3 lb
+    assert script.est_shipping(320) == 20.0    # 20 lb lands in the 11-20 lb tier
+    assert script.est_shipping(560) == 25.0    # 35 lb
+    assert script.est_shipping(1600) == 80.0   # 100 lb
+    assert script.est_shipping(1700) == 100.0  # over 100 lb
 
 
 def test_effective_min_profit_tiers_and_lowest_wins():
@@ -35,51 +39,53 @@ def test_effective_min_profit_tiers_and_lowest_wins():
 
 
 def test_expired_offer():
-    action, counter, _ = script.decide_offer(0, 100, 50, "N/A", False, SETTINGS)
+    action, counter, _ = script.decide_offer(0, 100, 50, 100, "N/A", False, SETTINGS)
     assert action == "Expired Offer"
     assert counter == 0.0
 
 
 def test_missing_site_cost():
     for bad in (0, 0.01):
-        action, _, _ = script.decide_offer(80, 100, bad, "N/A", False, SETTINGS)
+        action, _, _ = script.decide_offer(80, 100, bad, 100, "N/A", False, SETTINGS)
         assert action == "Missing Site Cost"
 
 
 def test_out_of_stock_is_skipped_but_expired_wins():
-    action, counter, _ = script.decide_offer(90, 100, 50, "N/A", False, SETTINGS, out_of_stock=True)
+    action, counter, _ = script.decide_offer(90, 100, 50, 100, "N/A", False, SETTINGS, out_of_stock=True)
     assert action == "Out of Stock"           # can't fulfill -> never answered
     assert counter == 0.0
     # No readable offer takes priority: label Expired, not Out of Stock.
-    action, _, _ = script.decide_offer(0, 100, 50, "N/A", False, SETTINGS, out_of_stock=True)
+    action, _, _ = script.decide_offer(0, 100, 50, 100, "N/A", False, SETTINGS, out_of_stock=True)
     assert action == "Expired Offer"
 
 
 def test_accept_when_offer_clears_margin():
-    action, counter, pct = script.decide_offer(200, 250, 100, "N/A", False, SETTINGS)
+    action, counter, pct = script.decide_offer(200, 250, 100, 32, "N/A", False, SETTINGS)
     assert action == "Accepted"
     assert counter == 0.0
     assert pct >= SETTINGS["min_profit"]
 
 
 def test_counter_within_band_that_clears():
-    action, counter, pct = script.decide_offer(90.0, 109.99, 69.17, "N/A", False, SETTINGS)
+    # weight 40 oz -> $10 shipping, total_cost 79.17: counters at the floor within the band
+    action, counter, pct = script.decide_offer(90.0, 109.99, 69.17, 40, "N/A", False, SETTINGS)
     assert action == "Counteroffer"
     assert pct >= SETTINGS["min_profit"]
     assert 109.99 * 0.90 <= counter <= 109.99 * 0.95   # inside the discount band
 
 
 def test_decline_when_even_shallow_discount_cannot_clear():
-    action, counter, _ = script.decide_offer(20, 24.29, 35.64, "N/A", False, SETTINGS)
+    action, counter, _ = script.decide_offer(20, 24.29, 35.64, 40, "N/A", False, SETTINGS)
     assert action == "Declined"
     assert counter == 0.0
 
 
 def test_dead_and_sell_below_cost_accept_where_normal_would_not():
-    # site_cost 50 -> total_cost 62; offer 76 yields ~6.4% margin: clears 4% but not 9%
-    normal = script.decide_offer(76, 100, 50, "N/A", False, SETTINGS)
-    dead = script.decide_offer(76, 100, 50, "Dead", False, SETTINGS)
-    sbc = script.decide_offer(76, 100, 50, "N/A", True, SETTINGS)
-    assert normal[0] != "Accepted"     # 6.4% < 9%
-    assert dead[0] == "Accepted"       # 6.4% >= 4%
-    assert sbc[0] == "Accepted"        # 6.4% >= 4%
+    # weight 40 oz -> $10 shipping, site_cost 50 -> total_cost 60; offer 74 yields
+    # ~6.9% margin: clears the 4% Dead / below-cost floor but not the 9% default
+    normal = script.decide_offer(74, 100, 50, 40, "N/A", False, SETTINGS)
+    dead = script.decide_offer(74, 100, 50, 40, "Dead", False, SETTINGS)
+    sbc = script.decide_offer(74, 100, 50, 40, "N/A", True, SETTINGS)
+    assert normal[0] != "Accepted"     # 6.9% < 9%
+    assert dead[0] == "Accepted"       # 6.9% >= 4%
+    assert sbc[0] == "Accepted"        # 6.9% >= 4%

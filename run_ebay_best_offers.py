@@ -308,7 +308,8 @@ def load_reference_data(conn: object) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read the site-cost and aged-status reference tables from the Reports database.
 
     Two plain SELECTs, kept to one row per SKU:
-      - ``SellerCloud``   -> the SKU's site cost and its EnableSellingBelowCost flag
+      - ``SellerCloud``   -> the SKU's site cost, shipping weight, and its
+                             EnableSellingBelowCost flag
       - ``AgedInventory`` -> the SKU's aged status (e.g. Dead / Slow)
 
     ``EnableSellingBelowCost`` is optional: the SellerCloud sync may not have added the
@@ -322,7 +323,7 @@ def load_reference_data(conn: object) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     Returns:
         ``(site_costs, aged)`` DataFrames with columns [sku, site_cost,
-        sell_below_cost] and [sku, aged_status].
+        weight_oz, sell_below_cost] and [sku, aged_status].
     """
     def read(query: str, columns: list[str]) -> pd.DataFrame:
         cursor = conn.cursor()
@@ -336,13 +337,18 @@ def load_reference_data(conn: object) -> tuple[pd.DataFrame, pd.DataFrame]:
         "WHERE TABLE_NAME = 'SellerCloud' AND COLUMN_NAME = 'EnableSellingBelowCost'"
     )
     if probe.fetchone() is not None:
-        site_costs = read("SELECT SKU, SiteCost, EnableSellingBelowCost FROM dbo.SellerCloud",
-                          ["sku", "site_cost", "sell_below_cost"])
+        site_costs = read("SELECT SKU, SiteCost, WeightLbs, WeightOz, EnableSellingBelowCost FROM dbo.SellerCloud",
+                          ["sku", "site_cost", "weight_lbs", "weight_oz_frac", "sell_below_cost"])
     else:
         log.warning("SellerCloud.EnableSellingBelowCost not found — treating every SKU as not "
                     "enable-selling-below-cost until the column exists and is populated.")
-        site_costs = read("SELECT SKU, SiteCost FROM dbo.SellerCloud", ["sku", "site_cost"])
+        site_costs = read("SELECT SKU, SiteCost, WeightLbs, WeightOz FROM dbo.SellerCloud",
+                          ["sku", "site_cost", "weight_lbs", "weight_oz_frac"])
         site_costs["sell_below_cost"] = False
+
+    site_costs["weight_oz"] = (pd.to_numeric(site_costs["weight_lbs"], errors="coerce").fillna(0) * 16
+                               + pd.to_numeric(site_costs["weight_oz_frac"], errors="coerce").fillna(0))
+    site_costs = site_costs[["sku", "site_cost", "weight_oz", "sell_below_cost"]]
 
     aged = read("SELECT SKU, Status FROM dbo.AgedInventory", ["sku", "aged_status"])
     return site_costs, aged
@@ -353,16 +359,17 @@ def enrich_offers(offers: pd.DataFrame, site_costs: pd.DataFrame, aged: pd.DataF
 
     Pure (no database) so it is easy to test. A SKU with no site-cost row gets
     0 — the decision treats 0 (and 0.01) as "cost unknown" and skips it rather
-    than risk a bad counteroffer. A SKU with no aged row gets "N/A"; a SKU with no
-    (or NULL) EnableSellingBelowCost flag is treated as False.
+    than risk a bad counteroffer. A SKU with no weight gets 0 ounces (the bad-weight
+    shipping rate). A SKU with no aged row gets "N/A"; a SKU with no (or NULL)
+    EnableSellingBelowCost flag is treated as False.
 
     Args:
         offers: The scraped offers table (see :func:`offers_to_frame`).
-        site_costs: [sku, site_cost, sell_below_cost] reference data.
+        site_costs: [sku, site_cost, weight_oz, sell_below_cost] reference data.
         aged: [sku, aged_status] reference data.
 
     Returns:
-        The offers table with ``site_cost``, ``aged_status`` and
+        The offers table with ``site_cost``, ``weight_oz``, ``aged_status`` and
         ``sell_below_cost`` columns added.
     """
     site_costs = site_costs.drop_duplicates("sku")  # one cost per SKU, never multiply rows
@@ -370,6 +377,7 @@ def enrich_offers(offers: pd.DataFrame, site_costs: pd.DataFrame, aged: pd.DataF
     df = offers.merge(site_costs, on="sku", how="left")
     df = df.merge(aged, on="sku", how="left")
     df["site_cost"] = pd.to_numeric(df["site_cost"], errors="coerce").fillna(0).round(2)
+    df["weight_oz"] = pd.to_numeric(df["weight_oz"], errors="coerce").fillna(0)
     df["aged_status"] = df["aged_status"].fillna("N/A")
     df["sell_below_cost"] = df["sell_below_cost"].fillna(False).astype(bool)
     return df
@@ -426,19 +434,36 @@ def upload_aged_inventory(aged_inv_path: str, today: str) -> None:
 # allowed band that still clears the minimum profit (aged / EnableSellingBelowCost items
 # ease that floor) — the best price for the buyer that still protects us.
 
-def est_shipping(site_cost: float, floor: float) -> float:
-    """Estimate what it costs us to ship an item, from its site cost.
+# Weight-based shipping tiers, keyed on total weight in ounces (WeightLbs * 16 +
+# WeightOz). Each entry is (upper bound inclusive, cost). Gaps between the stated
+# ranges (1-2 lb, 3-4 lb, 7-8 lb, 10-11 lb, 35-36 lb, 60-61 lb) are filled by
+# rounding a weight up into the next tier, so every weight maps to exactly one
+# rate; 20 lb resolves into the 11-20 lb tier. A zero or missing weight falls in
+# the lowest tier, which is also the "incorrect weight" bucket.
+SHIPPING_TIERS = [
+    (1, 15.00),      # <= 1 oz  -> bad / missing weight
+    (16, 8.00),      # <= 1 lb
+    (48, 10.00),     # <= 3 lb
+    (112, 15.00),    # <= 7 lb
+    (160, 18.00),    # <= 10 lb
+    (320, 20.00),    # <= 20 lb
+    (560, 25.00),    # <= 35 lb
+    (960, 40.00),    # <= 60 lb
+    (1600, 80.00),   # <= 100 lb
+]
+SHIPPING_OVER_MAX = 100.00  # > 100 lb
 
-    A tiered rate on the site cost (cheaper items ship at a higher %), with a
-    ``floor`` (the least we assume) that comes from the settings workbook.
+
+def est_shipping(weight_oz: float) -> float:
+    """Estimate what it costs us to ship an item, from its weight.
+
+    ``weight_oz`` is the item's total weight in ounces (lbs * 16 + oz). A zero or
+    missing weight lands in the lowest tier (the "incorrect weight" bucket).
     """
-    if site_cost < 1000:
-        rate = 0.05
-    elif site_cost < 2000:
-        rate = 0.03
-    else:
-        rate = 0.02
-    return round(max(site_cost * rate, floor), 2)
+    for upper_oz, cost in SHIPPING_TIERS:
+        if weight_oz <= upper_oz:
+            return cost
+    return SHIPPING_OVER_MAX
 
 
 def margin(price: float, total_cost: float, commission: float) -> float:
@@ -471,7 +496,7 @@ def effective_min_profit(aged_status: str, sell_below_cost: bool, settings: dict
 
 
 def decide_offer(cx_offer: float, current_price: float, site_cost: float,
-                 aged_status: str, sell_below_cost: bool, settings: dict,
+                 weight_oz: float, aged_status: str, sell_below_cost: bool, settings: dict,
                  out_of_stock: bool = False) -> tuple[str, float, float]:
     """Decide what to do with one buyer offer.
 
@@ -479,6 +504,7 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
         cx_offer: The buyer's offer amount (0 if there's no readable offer).
         current_price: Our current list price.
         site_cost: The SKU's site cost (0 or 0.01 means "cost unknown").
+        weight_oz: The SKU's total weight in ounces, for the shipping estimate.
         aged_status: The SKU's aged status ("Slow" / "Dead" ease the min profit).
         sell_below_cost: The SKU's EnableSellingBelowCost flag (also eases the min profit).
         settings: The control-workbook settings.
@@ -502,7 +528,7 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
 
     commission = settings["commission"]
     min_profit = effective_min_profit(aged_status, sell_below_cost, settings)
-    total_cost = site_cost + est_shipping(site_cost, settings["shipping_floor"])
+    total_cost = site_cost + est_shipping(weight_oz)
 
     # The buyer's own offer already clears the margin — accept it.
     if margin(cx_offer, total_cost, commission) >= min_profit:
@@ -541,15 +567,22 @@ TRADING_COMPAT_LEVEL = "1193"
 def _token_env(account: str) -> str:
     """Env var name holding a seller account's Trading API token.
 
-    ``Account4`` -> ``EBAY_AUTH_TOKEN_ACCOUNT4``.
+    Non-alphanumerics are stripped and the rest upper-cased, e.g.
+    ``Some Account-1`` -> ``EBAY_AUTH_TOKEN_SOMEACCOUNT1``.
     """
     return "EBAY_AUTH_TOKEN_" + re.sub(r"[^A-Za-z0-9]", "", account).upper()
 
 
-def build_get_best_offers_xml(token: str) -> str:
-    """Build the GetBestOffers request body — all active offers for the account.
+def build_get_best_offers_xml(token: str, page: int = 1) -> str:
+    """Build the GetBestOffers request body for one page of active offers.
 
     Pure (no HTTP) so it is easy to test. The token is XML-escaped defensively.
+    GetBestOffers paginates (eBay caps the page size and ignores a large
+    ``EntriesPerPage``), so :func:`get_best_offers` walks the pages by number.
+
+    Args:
+        token: The seller account's Trading API user token.
+        page: 1-based page number to request.
     """
     return (
         '<?xml version="1.0" encoding="utf-8"?>'
@@ -557,6 +590,7 @@ def build_get_best_offers_xml(token: str) -> str:
         f"<RequesterCredentials><eBayAuthToken>{html.escape(token)}</eBayAuthToken></RequesterCredentials>"
         "<BestOfferStatus>Active</BestOfferStatus>"
         "<DetailLevel>ReturnAll</DetailLevel>"
+        f"<Pagination><EntriesPerPage>100</EntriesPerPage><PageNumber>{int(page)}</PageNumber></Pagination>"
         "</GetBestOffersRequest>"
     )
 
@@ -573,8 +607,9 @@ def parse_best_offers(xml: bytes | str) -> dict:
             encoding declaration doesn't trip ElementTree).
 
     Returns:
-        ``{"ack": str, "errors": list[str], "offers": list[dict]}`` where each
-        offer is ``{item_number, cx_offer, best_offer_id, quantity, code, status}``.
+        ``{"ack": str, "errors": list[str], "offers": list[dict], "total_pages": int}``
+        where each offer is ``{item_number, cx_offer, best_offer_id, quantity, code,
+        status}`` and ``total_pages`` is how many pages the account's offers span.
     """
     if isinstance(xml, str):
         xml = xml.encode("utf-8")
@@ -598,17 +633,24 @@ def parse_best_offers(xml: bytes | str) -> dict:
                 "code": bo.findtext("BestOfferCodeType"),
                 "status": bo.findtext("Status"),
             })
-    return {"ack": root.findtext("Ack") or "", "errors": errors, "offers": offers}
+    total_pages_text = root.findtext(".//TotalNumberOfPages")
+    total_pages = int(total_pages_text) if total_pages_text and total_pages_text.isdigit() else 1
+    return {"ack": root.findtext("Ack") or "", "errors": errors, "offers": offers, "total_pages": total_pages}
 
 
 def get_best_offers(token: str) -> list[dict]:
-    """Call GetBestOffers and return the account's active offers.
+    """Call GetBestOffers across all pages and return the account's active offers.
+
+    GetBestOffers paginates: eBay returns a limited number of items per page and
+    reports ``TotalNumberOfPages``, so we must walk every page. Reading only page 1
+    silently drops every offer beyond it, which then reads as an expired offer.
 
     Args:
         token: The seller account's Trading API user token.
 
     Returns:
-        A list of ``{item_number, cx_offer, best_offer_id, code, status}``.
+        A list of ``{item_number, cx_offer, best_offer_id, quantity, code, status}``
+        for every active offer on the account, across all pages.
 
     Raises:
         RuntimeError: If eBay returns a Failure Ack (auth/keys/other), with the
@@ -623,12 +665,19 @@ def get_best_offers(token: str) -> list[dict]:
         "X-EBAY-API-CERT-NAME": get_env("EBAY_CERT_ID", required=True),
         "Content-Type": "text/xml",
     }
-    body = build_get_best_offers_xml(token).encode("utf-8")
-    resp = requests.post(TRADING_ENDPOINT, data=body, headers=headers, timeout=60)
-    result = parse_best_offers(resp.content)
-    if result["ack"] not in ("Success", "Warning"):
-        raise RuntimeError(f"GetBestOffers failed: {result['errors'] or resp.status_code}")
-    return result["offers"]
+    all_offers: list[dict] = []
+    page = 1
+    while True:
+        body = build_get_best_offers_xml(token, page).encode("utf-8")
+        resp = requests.post(TRADING_ENDPOINT, data=body, headers=headers, timeout=60)
+        result = parse_best_offers(resp.content)
+        if result["ack"] not in ("Success", "Warning"):
+            raise RuntimeError(f"GetBestOffers failed on page {page}: {result['errors'] or resp.status_code}")
+        all_offers.extend(result["offers"])
+        if page >= result["total_pages"]:
+            break
+        page += 1
+    return all_offers
 
 
 # =============================================================================
@@ -763,26 +812,26 @@ def _offer_log_line(row, settings: dict) -> str:
             f"after the lowest discount {settings['min_discount'] * 100:.0f}% applied.")
 
 
-def respond_to_offers(results: pd.DataFrame, api_by_item: dict, token: str, settings: dict, live: bool) -> dict:
+def respond_to_offers(results: pd.DataFrame, token: str, settings: dict, live: bool) -> dict:
     """Answer each decided offer on eBay (or log the intent in a dry run).
 
     Walks the decided rows and, for every Accept / Counter / Decline, sends one
-    RespondToBestOffer using the live ``BestOfferID`` from the API read. Skip reasons
+    RespondToBestOffer using that row's ``BestOfferID``. One listing can carry
+    several offers, so each row (each offer) is answered on its own. Skip reasons
     (Expired Offer, Missing Site Cost) are never sent. With ``live`` false nothing is
     sent — each intended action is logged instead. A single offer's failure (a bad
     ack or a network error) is logged and skipped so the rest still go through.
 
     Args:
-        results: The decided rows for one account (:func:`build_results` output).
-        api_by_item: ``item_number -> offer dict`` from :func:`get_best_offers`
-            (carries ``best_offer_id`` and ``quantity``).
+        results: The decided rows for one account, one per offer, each carrying its
+            ``best_offer_id`` and ``offer_quantity`` (:func:`build_results` output).
         token: The seller account's Trading API user token.
         settings: The control-workbook settings (for the declined-offer log line).
         live: Send for real when True; dry-run (log only) when False.
 
     Returns:
-        ``{item_number: answered_at}`` for offers answered successfully — used to
-        stamp ``acted_at`` so a rerun never answers them again.
+        ``{best_offer_id: answered_at}`` for offers answered successfully — used to
+        stamp ``acted_at`` per offer so a rerun never answers them again.
     """
     acted: dict = {}
     answered_at = datetime.now()
@@ -790,9 +839,8 @@ def respond_to_offers(results: pd.DataFrame, api_by_item: dict, token: str, sett
         ebay_action = RESPOND_ACTIONS.get(row.action)
         if ebay_action is None:
             continue  # Expired Offer / Missing Site Cost — nothing to send
-        info = api_by_item.get(row.item_number)
-        best_offer_id = info.get("best_offer_id") if info else None
-        if not best_offer_id:
+        best_offer_id = row.best_offer_id
+        if pd.isna(best_offer_id) or not best_offer_id:
             log.warning(f"No BestOfferID for {row.account}/{row.item_number} — cannot {ebay_action}; skipped.")
             continue
 
@@ -802,7 +850,7 @@ def respond_to_offers(results: pd.DataFrame, api_by_item: dict, token: str, sett
             price, message = None, DECLINE_MESSAGE
         else:
             price, message = None, None
-        quantity = int(info.get("quantity", 1) or 1)
+        quantity = int(row.offer_quantity or 1)
         line = _offer_log_line(row, settings)
 
         if not live:
@@ -815,7 +863,7 @@ def respond_to_offers(results: pd.DataFrame, api_by_item: dict, token: str, sett
             log.error(f"{ebay_action} call errored for {row.account}/{row.item_number}: {exc}")
             continue
         if resp["ack"] in ("Success", "Warning"):
-            acted[row.item_number] = answered_at
+            acted[best_offer_id] = answered_at
             log.success(line)
         else:
             log.error(f"{ebay_action} rejected for {row.account}/{row.item_number}: {resp['errors']}")
@@ -837,6 +885,43 @@ RESULT_COLUMNS = [
 ]
 
 
+def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFrame:
+    """Attach the API's live offers to the scraped grid, one row per offer.
+
+    A single listing can carry several buyer offers; each becomes its own row so
+    every offer is decided and answered, not just one. A grid item with no live
+    offer keeps a single row with ``cx_offer`` 0 (it reads as an expired offer)
+    and ``best_offer_id`` None. Buyer identity is never carried across.
+
+    Args:
+        offers: The enriched grid, one row per listing.
+        api_offers: :func:`get_best_offers` output — one dict per active offer.
+
+    Returns:
+        The offers table expanded to one row per offer, with ``cx_offer``,
+        ``best_offer_id`` and ``offer_quantity`` columns added.
+    """
+    cols = ["item_number", "cx_offer", "best_offer_id", "offer_quantity"]
+    if api_offers:
+        api_df = pd.DataFrame([
+            {
+                "item_number": o["item_number"],
+                "cx_offer": o["cx_offer"],
+                "best_offer_id": o["best_offer_id"],
+                "offer_quantity": o.get("quantity", 1),
+            }
+            for o in api_offers
+        ])
+    else:
+        api_df = pd.DataFrame(columns=cols)
+
+    merged = offers.merge(api_df, on="item_number", how="left")
+    merged["cx_offer"] = pd.to_numeric(merged["cx_offer"], errors="coerce").fillna(0.0)
+    merged["offer_quantity"] = pd.to_numeric(merged["offer_quantity"], errors="coerce").fillna(1).astype(int)
+    merged["best_offer_id"] = merged["best_offer_id"].where(merged["best_offer_id"].notna(), None)  # NaN -> None for no-offer rows
+    return merged
+
+
 def build_results(offers: pd.DataFrame, settings: dict) -> pd.DataFrame:
     """Compute the full archive record for each enriched offer.
 
@@ -848,21 +933,25 @@ def build_results(offers: pd.DataFrame, settings: dict) -> pd.DataFrame:
     misleading 0.
 
     Args:
-        offers: Enriched offers with a ``cx_offer`` column (see
-            :func:`enrich_offers` and :func:`get_best_offers`).
+        offers: One row per offer, with ``cx_offer``, ``best_offer_id`` and
+            ``offer_quantity`` columns (see :func:`enrich_offers` and
+            :func:`attach_api_offers`).
         settings: The control-workbook settings.
 
     Returns:
-        A DataFrame of ``RESULT_COLUMNS``, one row per offer, ready to store.
+        A DataFrame of ``RESULT_COLUMNS`` plus the ``best_offer_id`` and
+        ``offer_quantity`` needed to answer each offer, one row per offer. Only
+        ``RESULT_COLUMNS`` (+ ``acted_at``) are stored; the two extras stay in
+        memory for :func:`respond_to_offers`.
     """
     commission = settings["commission"]
     records = []
     for row in offers.itertuples(index=False):
-        shipping = est_shipping(row.site_cost, settings["shipping_floor"])
+        shipping = est_shipping(row.weight_oz)
         total_cost = round(row.site_cost + shipping, 2)
 
         action, counter_price, _ = decide_offer(
-            row.cx_offer, row.current_price, row.site_cost,
+            row.cx_offer, row.current_price, row.site_cost, row.weight_oz,
             row.aged_status, row.sell_below_cost, settings, bool(row.out_of_stock)
         )
         # buyer_margin only means something when the offer is actually priceable.
@@ -892,8 +981,10 @@ def build_results(offers: pd.DataFrame, settings: dict) -> pd.DataFrame:
             "discount": discount,
             "counter_margin": counter_margin,
             "out_of_stock": bool(row.out_of_stock),
+            "best_offer_id": row.best_offer_id,
+            "offer_quantity": int(row.offer_quantity),
         })
-    return pd.DataFrame(records, columns=RESULT_COLUMNS)
+    return pd.DataFrame(records, columns=RESULT_COLUMNS + ["best_offer_id", "offer_quantity"])
 
 
 # --- Store in the permanent archive ------------------------------------------
@@ -1063,8 +1154,8 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
         f"Rules used: commission {settings['commission']:.1%}; minimum profit {settings['min_profit']:.1%} "
         f"(Slow {settings['slow_min_profit']:.1%}, Dead {settings['dead_min_profit']:.1%}, "
         f"enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%}); counter discount band "
-        f"{settings['min_discount']:.0%} to {settings['max_discount']:.0%}; estimated shipping floor "
-        f"${settings['shipping_floor']:,.2f}.</p>"
+        f"{settings['min_discount']:.0%} to {settings['max_discount']:.0%}; shipping estimated "
+        "by item weight.</p>"
     )
     intro = (
         f"<p style='{font}'>{esc(greeting)},</p>"
@@ -1150,7 +1241,7 @@ def main() -> None:
         f"min profit {settings['min_profit']:.1%} (Slow {settings['slow_min_profit']:.1%}, "
         f"Dead {settings['dead_min_profit']:.1%}, enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%}), "
         f"discount band {settings['min_discount']:.0%}-{settings['max_discount']:.0%}, "
-        f"shipping floor ${settings['shipping_floor']:,.2f}."
+        "shipping estimated by item weight."
     )
 
     today = date.today().strftime("%Y-%m-%d")
@@ -1209,20 +1300,20 @@ def main() -> None:
                 offers = enrich_offers(offers, site_costs, aged)
 
                 # Read every buyer offer in one Trading API call — no page navigation,
-                # so eBay's bot check never fires. An item in the grid but not in the
-                # API response has no active offer (cx_offer 0 -> Expired Offer).
+                # so eBay's bot check never fires. A listing can have several offers, so
+                # attach_api_offers expands to one row per offer. A grid item with no
+                # active offer becomes one row with cx_offer 0 -> Expired Offer.
                 token = get_env(_token_env(account), required=True)
                 api_offers = get_best_offers(token)
-                cx_by_item = {o["item_number"]: o["cx_offer"] for o in api_offers}
-                offers["cx_offer"] = offers["item_number"].map(cx_by_item).fillna(0.0)
+                offers = attach_api_offers(offers, api_offers)
 
                 results = build_results(offers, settings)
 
                 # Answer each decided offer on eBay (or just log the intent in a dry run),
-                # then stamp acted_at on the ones answered so a rerun won't answer them again.
-                api_by_item = {o["item_number"]: o for o in api_offers}
-                acted = respond_to_offers(results, api_by_item, token, settings, act_live)
-                results["acted_at"] = results["item_number"].map(acted)
+                # then stamp acted_at (keyed by BestOfferID) on the ones answered so a
+                # rerun won't answer them again.
+                acted = respond_to_offers(results, token, settings, act_live)
+                results["acted_at"] = results["best_offer_id"].map(acted)
 
                 store_account_results(ebay_conn, results, account, today)
                 injected.append(account)

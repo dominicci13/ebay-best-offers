@@ -19,12 +19,13 @@ SETTINGS = {
 # A counter, an accept, a decline; one account name carries an ampersand (must escape).
 OFFERS = pd.DataFrame(
     [
-        ("2026-07-07", "Account A", "Cold CS-22C", "CS-22C&X", 109.99, "111", False, 69.17, "N/A", 90.0, False),
-        ("2026-07-07", "Account A", "Sony A7", "SNY", 250.00, "222", False, 100.00, "Slow", 200.0, False),
-        ("2026-07-07", "Account2", "Kodak EKMSD", "EK", 24.29, "333", False, 35.64, "N/A", 20.0, False),
+        ("2026-07-07", "Acme & Co", "Cold CS-22C", "CS-22C&X", 109.99, "111", False, 69.17, 40.0, "N/A", 90.0, False, "b-111", 1),
+        ("2026-07-07", "Acme & Co", "Sony A7", "SNY", 250.00, "222", False, 100.00, 32.0, "Slow", 200.0, False, "b-222", 1),
+        ("2026-07-07", "Account Two", "Kodak EKMSD", "EK", 24.29, "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1),
     ],
     columns=["date", "account", "title", "sku", "current_price", "item_number",
-             "out_of_stock", "site_cost", "aged_status", "cx_offer", "sell_below_cost"],
+             "out_of_stock", "site_cost", "weight_oz", "aged_status", "cx_offer",
+             "sell_below_cost", "best_offer_id", "offer_quantity"],
 )
 RESULTS = script.build_results(OFFERS, SETTINGS)
 
@@ -32,8 +33,8 @@ RESULTS = script.build_results(OFFERS, SETTINGS)
 def test_has_date_accounts_and_totals():
     body = script.build_summary_email(RESULTS, SETTINGS)
     assert "07/07/2026" in body            # date reformatted to the fleet's MM/DD/YYYY
-    assert "Account A" in body        # account name escaped
-    assert "Account2" in body
+    assert "Acme &amp; Co" in body         # account name escaped
+    assert "Account Two" in body
     assert "All accounts" in body          # totals row
 
 
@@ -45,8 +46,8 @@ def test_counteroffer_detail_moved_to_workbook():
 
 def test_account_names_are_html_escaped():
     body = script.build_summary_email(RESULTS, SETTINGS)
-    assert "Account A" in body        # ampersand escaped
-    assert "Account A<" not in body       # raw unescaped ampersand not emitted
+    assert "Acme &amp; Co" in body         # ampersand escaped
+    assert "Acme & Co<" not in body        # raw unescaped ampersand not emitted
 
 
 def test_footer_reflects_settings_not_hardcoded():
@@ -55,7 +56,7 @@ def test_footer_reflects_settings_not_hardcoded():
     assert "9.0%" in body                  # default minimum profit
     assert "Slow 6.0%" in body             # aged tiers echoed
     assert "5% to 10%" in body             # discount band from min/max
-    assert "$12.00" in body                # shipping floor
+    assert "shipping estimated by item weight" in body
 
 
 def test_avoids_dash_ai_tells():

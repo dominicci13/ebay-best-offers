@@ -19,11 +19,11 @@ def test_offers_to_frame_shapes_and_orders_columns():
         # out of stock: no Respond link
         ["456789012345", "Acme Rifle Scope 4-12x40", "ACM-RS-003", "$129.99", ""],
     ]
-    df = script.offers_to_frame(rows, "Account1", "2026-07-02")
+    df = script.offers_to_frame(rows, "Acct1", "2026-07-02")
 
     assert list(df.columns) == COLUMNS
     assert df.iloc[0]["date"] == "2026-07-02"
-    assert df.iloc[0]["account"] == "Account1"
+    assert df.iloc[0]["account"] == "Acct1"
     assert df.iloc[0]["item_number"] == "234567890123"
     # "$3,849.00" -> 3849.0
     assert df.iloc[1]["current_price"] == 3849.0
@@ -32,6 +32,6 @@ def test_offers_to_frame_shapes_and_orders_columns():
 
 
 def test_offers_to_frame_handles_empty():
-    df = script.offers_to_frame([], "Account1", "2026-07-02")
+    df = script.offers_to_frame([], "Acct1", "2026-07-02")
     assert list(df.columns) == COLUMNS
     assert len(df) == 0
