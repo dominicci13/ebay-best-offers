@@ -39,7 +39,10 @@ append-only archive** that never loses a day.
    counteroffer with its buyer message, or Decline with its message. Gated behind
    `ACT_ON_OFFERS`: off, it logs the intended action and sends nothing.
 7. **Record** the full row to `eBay.dbo.BestOffers` — the permanent archive.
-8. **Report** — refresh the read-only workbook and send the summary email.
+8. **Report** — refresh the read-only workbook and send the summary email. Its table
+   has a column per outcome except Expired Offer (dropped once the pagination fix
+   stopped producing them); the Total sums the columns shown, and the workbook still
+   carries every row.
 
 ## Architecture
 
@@ -98,8 +101,11 @@ The est_shipping weight tiers are a pricing table in code (`SHIPPING_TIERS`).
 kept. The report shows only today (its Power Query filters on `report_date`).
 Same-day reruns are idempotent per account: an account's not-yet-answered rows are
 replaced with the latest scrape, and an account whose offers were all answered is
-skipped. If one account fails mid-run, only that run's un-answered inserts are
-undone and a crash report is emailed, naming the account.
+skipped. Accounts are independent: one that fails is skipped and the rest still run.
+Its rows are cleared only if the failure hit the insert itself, so a failure earlier
+in the account (browser, API) leaves an earlier run's rows intact. Failed accounts
+are named in a banner on the summary email and in one crash report sent at the end;
+the run exits non-zero only if no account was recorded at all.
 
 ## Settings (control workbook)
 

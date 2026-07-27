@@ -15,6 +15,11 @@ Runs once a day at 17:30 local time. Each run:
 5. Writes the full result set to SQL and sends a summary email with the
    read-only report workbook attached.                               [Step 5]
 
+Accounts are processed independently. One that fails has its own un-answered rows
+for the day cleared, then it is skipped so the remaining accounts still run; the
+failures are named in the summary email and sent together in a single crash report
+at the end. The run exits non-zero only if no account was recorded at all.
+
 Import-safe: the prompt and the scheduler run only under
 ``if __name__ == "__main__"``, so tests can import this module freely.
 """
@@ -1046,10 +1051,10 @@ def store_account_results(conn: object, results: pd.DataFrame, account: str, tod
 def remove_run_results(conn: object, accounts: list[str], today: str) -> None:
     """Undo this run's not-yet-answered inserts for the given accounts after a failure.
 
-    Keeps a run all-or-nothing for work that wasn't finalized: if one account fails,
-    the un-answered rows this run inserted are removed so the day isn't left
-    half-recorded. Rows already answered (a real offer was sent) and past days are
-    never touched.
+    Called with just the account that failed, so its half-written day is cleared while
+    every account that already finished keeps its rows. ``insert_dataframe`` commits per
+    chunk, so this is the cleanup a rollback cannot do. Rows already answered (a real
+    offer was sent) and past days are never touched.
     """
     if not accounts:
         return
@@ -1070,9 +1075,14 @@ def remove_run_results(conn: object, accounts: list[str], today: str) -> None:
 # straight from the in-memory results and sent to the stakeholders with the
 # refreshed workbook attached. Rates/brands come from `settings`.
 
+# The columns of the email summary table, in order. "Expired Offer" is deliberately
+# absent: the 7/23 GetBestOffers pagination fix removed what was causing it (none have
+# landed since), so the column only added noise. An Expired row can still reach SQL and
+# the workbook — it just isn't a column here, and the Total below counts only what the
+# table shows so the row always adds up.
 REPORT_ACTIONS = [
     "Accepted", "Counteroffer", "Declined",
-    "Expired Offer", "Out of Stock", "Missing Site Cost",
+    "Out of Stock", "Missing Site Cost",
 ]
 
 # Short column headers for the email summary table (the SQL/action names run long).
@@ -1080,13 +1090,13 @@ ACTION_LABELS = {
     "Accepted": "Accepted",
     "Counteroffer": "Counter",
     "Declined": "Declined",
-    "Expired Offer": "Expired",
     "Out of Stock": "Out of Stock",
     "Missing Site Cost": "Missing Cost",
 }
 
 
-def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: str | None = None) -> str:
+def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: str | None = None,
+                        failed_accounts: list[str] | None = None) -> str:
     """Build the HTML summary of today's decisions from the in-memory results.
 
     Reads only the current time (for the greeting) — no Outlook/Excel — so it is
@@ -1097,11 +1107,17 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
     here. Account names are HTML-escaped so a stray ``&`` or ``<`` can't break the
     email.
 
+    An account can now fail on its own without stopping the run, so any account
+    that did not finish is named in a banner above the table. The counts below it
+    only cover the accounts that completed, and a partial report that looked
+    complete would quietly understate the day.
+
     Args:
         results: Today's combined result rows (see :func:`build_results`).
         settings: The control-workbook settings.
         greeting_text: Override the greeting (used by tests); defaults to the
             time-of-day greeting for the current hour.
+        failed_accounts: Accounts that failed this run, or None if all completed.
 
     Returns:
         The email body as an HTML string.
@@ -1128,23 +1144,25 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
                 f"color:{color};font-weight:{'700' if bold else '400'};font-size:13px;"
                 f"border-bottom:1px solid #e2e8f0;{top}'>{value}</td>")
 
-    # Per-account count of each outcome. Zeros show blank for a calmer table.
+    # Per-account count of each outcome. Zeros show blank for a calmer table. Totals sum
+    # the columns rather than the row count, so an action the table doesn't show (see
+    # REPORT_ACTIONS) can never leave the Total disagreeing with the cells beside it.
     header = th("Account", "left") + "".join(th(ACTION_LABELS[a]) for a in REPORT_ACTIONS) + th("Total")
     body_rows = ""
     for i, account in enumerate(dict.fromkeys(results["account"])):
         acc = results[results["account"] == account]
         bg = "#f8fafc" if i % 2 else "#ffffff"
+        counts = [int((acc["action"] == action).sum()) for action in REPORT_ACTIONS]
         cells = td(esc(account), "left", bg, bold=True)
-        for action in REPORT_ACTIONS:
-            cells += td(int((acc["action"] == action).sum()) or "", bg=bg)
-        cells += td(len(acc), bg=bg, bold=True)
+        cells += "".join(td(n or "", bg=bg) for n in counts)
+        cells += td(sum(counts), bg=bg, bold=True)
         body_rows += f"<tr>{cells}</tr>"
 
     top = "border-top:2px solid #334155"
+    totals = [int((results["action"] == action).sum()) for action in REPORT_ACTIONS]
     total_row = td("All accounts", "left", "#e2e8f0", bold=True, top=top)
-    for action in REPORT_ACTIONS:
-        total_row += td(int((results["action"] == action).sum()) or "", bg="#e2e8f0", bold=True, top=top)
-    total_row += td(len(results), bg="#e2e8f0", bold=True, top=top)
+    total_row += "".join(td(n or "", bg="#e2e8f0", bold=True, top=top) for n in totals)
+    total_row += td(sum(totals), bg="#e2e8f0", bold=True, top=top)
 
     table = (
         "<table style='border-collapse:collapse;margin:8px 0 4px'>"
@@ -1164,15 +1182,30 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
         f"<p style='{font}'>Here is today's summary of the pending Best Offers across all seller "
         "accounts. The attached workbook has the full detail for every offer.</p>"
     )
+
+    banner = ""
+    if failed_accounts:
+        names = ", ".join(esc(a) for a in failed_accounts)
+        count = len(failed_accounts)
+        noun = "account" if count == 1 else "accounts"
+        banner = (
+            f"<p style='{font};font-size:13px;background-color:#fef3c7;color:#92400e;"
+            "border-left:4px solid #f59e0b;padding:10px 12px;margin:12px 0 4px'>"
+            f"<b>Heads up:</b> {count} {noun} did not run today ({names}). Their pending offers "
+            "were not read or answered, so the counts below cover only the accounts that finished."
+            "</p>"
+        )
+
     title = f"<p style='{font};font-weight:600;font-size:14px;margin:14px 0 4px'>Today's Best Offers ({report_date})</p>"
     closing = (
         f"<p style='{font}'>Let me know if you have any questions.</p>"
         f"<p style='{font}'>Thanks,</p>"
     )
-    return f"<div>{intro}{title}{table}{footer}{closing}</div>"
+    return f"<div>{intro}{banner}{title}{table}{footer}{closing}</div>"
 
 
-def send_summary_email(results: pd.DataFrame, settings: dict, workbook_path: str | None) -> None:
+def send_summary_email(results: pd.DataFrame, settings: dict, workbook_path: str | None,
+                       failed_accounts: list[str] | None = None) -> None:
     """Refresh the report workbook and send the summary email to the stakeholders.
 
     The refreshed workbook is attached. A refresh failure is logged and the email
@@ -1184,6 +1217,8 @@ def send_summary_email(results: pd.DataFrame, settings: dict, workbook_path: str
         results: Today's combined result rows.
         settings: The control-workbook settings.
         workbook_path: Path to the report workbook, or None to skip the attachment.
+        failed_accounts: Accounts that failed this run, named in a banner so a
+            partial run is never mistaken for a complete one.
     """
     if workbook_path:
         try:
@@ -1198,7 +1233,7 @@ def send_summary_email(results: pd.DataFrame, settings: dict, workbook_path: str
     send_email(
         account=get_env("SENDER_EMAIL", required=True),
         subject=f"eBay Report - Best Offers - {datetime.now().strftime('%m/%d/%Y')}",
-        body=build_summary_email(results, settings),
+        body=build_summary_email(results, settings, failed_accounts=failed_accounts),
         to=report_to,
         cc=report_cc,
         attachments=attachments,
@@ -1258,11 +1293,11 @@ def main() -> None:
         log.info("Dry run — offers are decided and recorded but not answered on eBay (ACT_ON_OFFERS off).")
 
     # Wrap the operational body so any unexpected failure emails a crash report.
-    # Per-account failures already alert and stop inside the loop (they raise
-    # SystemExit, which bypasses this handler); this catches everything else
-    # (aged upload, reference load, SQL connection).
+    # Per-account failures are caught in the loop and never reach here; this catches
+    # what would sink the whole run either way (aged upload, reference load, SQL
+    # connection) and is the only path that stops it.
     ebay_conn = None
-    injected: list[str] = []
+    failed: dict[str, str] = {}  # account -> traceback, reported together after the loop
     all_results: list[pd.DataFrame] = []
     try:
         # Refresh Aged Inventory from its Excel report if it was updated today.
@@ -1280,8 +1315,9 @@ def main() -> None:
 
         # Scrape, enrich, decide, answer, and archive each account. A rerun refreshes
         # each account's not-yet-answered rows and skips accounts already fully answered.
-        # If an account fails, this run's un-answered inserts are undone and the team is
-        # alerted. Offers are answered on eBay only when ACT_ON_OFFERS is set (else dry run).
+        # Accounts are independent: one that fails is cleaned up, recorded, and skipped so
+        # the rest still run — a browser flake on account 2 used to cost accounts 3 and 4
+        # their whole day. Offers are answered on eBay only when ACT_ON_OFFERS is set.
         ebay_conn = custom_functions.sql_connection(RESULTS_DB)
         for account, profile in EBAY_PROFILES.items():
             if account_fully_acted(ebay_conn, account, today):
@@ -1317,20 +1353,38 @@ def main() -> None:
                 acted = respond_to_offers(results, token, settings, act_live)
                 results["acted_at"] = results["best_offer_id"].map(acted)
 
-                store_account_results(ebay_conn, results, account, today)
-                injected.append(account)
+                # insert_dataframe commits per chunk, so a failure part-way through leaves
+                # committed rows no rollback can reach. Clear this account's un-answered rows
+                # only when the insert was actually in flight: a failure before this point
+                # must not touch rows an earlier run today already recorded.
+                try:
+                    store_account_results(ebay_conn, results, account, today)
+                except Exception:
+                    try:
+                        remove_run_results(ebay_conn, [account], today)
+                    except Exception:
+                        log.warning(f"Could not clear [cyan]{account}[/cyan]'s partial insert.")
+                    raise
+
                 all_results.append(results)
                 counts = ", ".join(f"{n} {a}" for a, n in results["action"].value_counts().items()) or "none"
                 log.success(f"[cyan]{account}[/cyan] — recorded {len(results)} offers ({counts}).")
             except Exception:
-                log.error(f"Failed on [cyan]{account}[/cyan] — undoing this run's inserts and alerting.")
-                ebay_conn.rollback()  # drop the failed account's uncommitted partial insert
-                remove_run_results(ebay_conn, injected, today)
-                alert_utils.handle_crash(
-                    driver, traceback.format_exc(),
-                    automation_name=f"eBay Best Offers (failed on {account})",
-                )
-                raise SystemExit(1)
+                tb = traceback.format_exc()
+                log.error(f"Failed on [cyan]{account}[/cyan] — skipping it and continuing with the rest.")
+                ebay_conn.rollback()
+
+                # Capture the page instead of calling handle_crash here: handle_crash ends by
+                # killing Excel and Chrome, which is right as terminal cleanup but would take
+                # out any workbook the user has open mid-run. One alert goes out at the end.
+                shot = ""
+                if driver is not None:
+                    try:
+                        shot = save_debug_screenshot(driver, root=account, section="main",
+                                                     description="account_failed")
+                    except Exception:
+                        log.warning(f"Could not capture the failure screenshot for [cyan]{account}[/cyan].")
+                failed[account] = f"Screenshot: {shot or 'not captured'}\n\n{tb}"
             finally:
                 if driver is not None:
                     try:
@@ -1346,13 +1400,30 @@ def main() -> None:
 
     # Refresh the report workbook and send the summary email. Non-fatal:
     # today's results are already stored, so a workbook or email hiccup must not fail
-    # the run or roll back the archive.
+    # the run or roll back the archive. Any account that failed is named in the email
+    # so a partial run is never read as a complete one.
     if all_results:
         try:
-            send_summary_email(pd.concat(all_results, ignore_index=True), settings, paths.get("report_wb_path"))
+            send_summary_email(pd.concat(all_results, ignore_index=True), settings,
+                               paths.get("report_wb_path"), failed_accounts=list(failed))
         except Exception:
             log.error("Report/email step failed — today's results are safely stored in SQL.")
             traceback.print_exc()
+
+    # One crash report covering every account that failed, sent after the stakeholders'
+    # report so handle_crash's Excel/Chrome cleanup stays terminal. The run only exits
+    # non-zero when nothing was recorded at all, so the scheduler logs a real failure
+    # without crying wolf over a single flaky account.
+    if failed:
+        names = ", ".join(failed)
+        log.error(f"Run finished with failures on [cyan]{names}[/cyan].")
+        alert_utils.handle_crash(
+            None,
+            "\n\n".join(f"=== {account} ===\n{tb}" for account, tb in failed.items()),
+            automation_name=f"eBay Best Offers (failed on {names})",
+        )
+        if not all_results:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
