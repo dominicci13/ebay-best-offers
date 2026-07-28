@@ -67,7 +67,8 @@ flowchart LR
 
 ## Decision rule
 
-`decide_offer(cx_offer, current_price, site_cost, aged_status, sell_below_cost, settings)`
+`decide_offer(cx_offer, current_price, site_cost, weight_oz, aged_status,
+sell_below_cost, settings, out_of_stock, account)`
 is a pure function from the offer's numbers to `(action, counter_price, margin)`.
 For each offer it tests, in order:
 
@@ -84,6 +85,19 @@ The **minimum profit floor is per-item**: the default, eased to a lower floor fo
 Slow / Dead aged items or an EnableSellingBelowCost SKU (the lowest applicable wins), so
 flagged inventory can be countered deeper. Every threshold comes from the control
 workbook, never from the code.
+
+**Some accounts override all of that.** An account listed in `flat_min_profit_accounts`
+(in gitignored `config/accounts.json`) prices every item to a single flat floor, aged or
+not — the Slow / Dead / below-cost easings never apply to it. The config maps the account
+to its own label in the settings workbook:
+
+```json
+"flat_min_profit_accounts": { "Account4": "Account4 minimum profit margin" }
+```
+
+Each configured label becomes a **required** workbook value, so a missing cell stops the
+run like any other setting instead of quietly pricing at the default floor. Account names
+and their margins stay out of this public repo.
 
 ```text
 margin      = (price - total_cost - price * commission) / price
@@ -110,11 +124,11 @@ the run exits non-zero only if no account was recorded at all.
 ## Settings (control workbook)
 
 Business users edit `Best-Offers-Settings.xlsx`, read with pandas (no Excel COM):
-commission; the minimum profit floors (default, Slow, Dead, sell-below-cost); and the
-min/max counteroffer discount. Shipping is estimated from each item's weight, so it
-is not a workbook value. Nothing else business-tunable lives in code or environment
-variables. A missing or invalid value
-stops the run and sends a plain-language fix-it email.
+commission; the minimum profit floors (default, Slow, Dead, sell-below-cost, plus one
+per flat-floor account); and the min/max counteroffer discount. Shipping is estimated
+from each item's weight, so it is not a workbook value. Nothing else business-tunable
+lives in code or environment variables. A missing or invalid value stops the run and
+sends a plain-language fix-it email.
 
 ## Logging
 

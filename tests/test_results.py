@@ -8,6 +8,7 @@ from __future__ import annotations
 import pandas as pd
 
 import run_ebay_best_offers as script
+from conftest import FLAT_ACCOUNT
 
 SETTINGS = {
     "commission": 0.12,
@@ -15,6 +16,7 @@ SETTINGS = {
     "slow_min_profit": 0.06,
     "dead_min_profit": 0.04,
     "sell_below_cost_min_profit": 0.04,
+    "flat_min_profit::AccountFlat": 0.02,
     "min_discount": 0.05,
     "max_discount": 0.10,
     "shipping_floor": 12.0,
@@ -146,3 +148,19 @@ def test_attach_api_offers_no_offer_reads_as_expired():
     assert out.iloc[0]["best_offer_id"] is None
     result = script.build_results(out, SETTINGS)
     assert result.iloc[0]["action"] == "Expired Offer"
+
+
+def test_account_reaches_the_decision_so_a_flat_floor_account_gets_its_floor():
+    """The account must travel from the frame into decide_offer, or a flat-floor
+    account silently keeps the 9% default and the whole rule is a no-op."""
+    same_offer = [
+        ("2026-07-02", FLAT_ACCOUNT, "Flat", "F1", 100.00, "801", False,
+         50.00, 40.0, "Dead", 70.0, False, "b-801", 1),
+        ("2026-07-02", "SomeOtherAccount", "Flat", "F1", 100.00, "802", False,
+         50.00, 40.0, "Dead", 70.0, False, "b-802", 1),
+    ]
+    frame = pd.DataFrame(same_offer, columns=OFFERS.columns)
+    rows = {r.item_number: r for r in script.build_results(frame, SETTINGS).itertuples(index=False)}
+    # ~2.9% margin: clears the flat 2%, misses the 4% Dead floor everywhere else.
+    assert rows["801"].action == "Accepted"
+    assert rows["802"].action != "Accepted"

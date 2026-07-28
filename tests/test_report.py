@@ -11,6 +11,7 @@ SETTINGS = {
     "slow_min_profit": 0.06,
     "dead_min_profit": 0.04,
     "sell_below_cost_min_profit": 0.04,
+    "flat_min_profit::AccountFlat": 0.02,
     "min_discount": 0.05,
     "max_discount": 0.10,
     "shipping_floor": 12.0,
@@ -83,15 +84,15 @@ def test_no_banner_when_every_account_succeeded():
 
 
 def test_banner_names_each_failed_account():
-    body = script.build_summary_email(RESULTS, SETTINGS, failed_accounts=["Account2", "Account3"])
+    body = script.build_summary_email(RESULTS, SETTINGS, failed_accounts=["Acct2", "Acct3"])
     assert "2 accounts did not run" in body
-    assert "Account2" in body
-    assert "Account3" in body
+    assert "Acct2" in body
+    assert "Acct3" in body
     assert "were not read or answered" in body
 
 
 def test_banner_singular_for_one_failed_account():
-    body = script.build_summary_email(RESULTS, SETTINGS, failed_accounts=["Account2"])
+    body = script.build_summary_email(RESULTS, SETTINGS, failed_accounts=["Acct2"])
     assert "1 account did not run" in body
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import run_ebay_best_offers as script
+from conftest import FLAT_ACCOUNT
 
 SETTINGS = {
     "commission": 0.12,
@@ -9,6 +10,7 @@ SETTINGS = {
     "slow_min_profit": 0.06,
     "dead_min_profit": 0.04,
     "sell_below_cost_min_profit": 0.04,
+    "flat_min_profit::AccountFlat": 0.02,
     "min_discount": 0.05,
     "max_discount": 0.10,
     "shipping_floor": 12.0,
@@ -36,6 +38,44 @@ def test_effective_min_profit_tiers_and_lowest_wins():
     assert emp("N/A", True, SETTINGS) == 0.04      # SellBelowCost
     assert emp("slow", False, SETTINGS) == 0.06    # case-insensitive
     assert emp("Slow", True, SETTINGS) == 0.04     # lowest applicable wins (6% vs 4%)
+
+
+def test_flat_floor_account_uses_one_floor_for_every_item():
+    emp = script.effective_min_profit
+    # "all items, not age dependent" — the aged / below-cost easings never apply here.
+    assert emp("N/A", False, SETTINGS, FLAT_ACCOUNT) == 0.02
+    assert emp("Slow", False, SETTINGS, FLAT_ACCOUNT) == 0.02
+    assert emp("Dead", False, SETTINGS, FLAT_ACCOUNT) == 0.02
+    assert emp("N/A", True, SETTINGS, FLAT_ACCOUNT) == 0.02
+    assert emp("Dead", True, SETTINGS, FLAT_ACCOUNT) == 0.02
+
+
+def test_other_accounts_keep_the_aged_tiers():
+    emp = script.effective_min_profit
+    for account in ("SomeOtherAccount", ""):
+        assert emp("N/A", False, SETTINGS, account) == 0.09
+        assert emp("Dead", False, SETTINGS, account) == 0.04
+
+
+def test_flat_floor_account_accepts_where_other_accounts_counter():
+    # weight 40 oz -> $10 shipping, site_cost 50 -> total_cost 60; offer 70 yields
+    # ~2.9% margin: clears the 2% flat floor but none of the other accounts' floors.
+    flat = script.decide_offer(70, 100, 50, 40, "N/A", False, SETTINGS, False, FLAT_ACCOUNT)
+    other = script.decide_offer(70, 100, 50, 40, "N/A", False, SETTINGS, False, "SomeOtherAccount")
+    assert flat[0] == "Accepted"
+    assert flat[2] >= SETTINGS[script.flat_floor_key(FLAT_ACCOUNT)]
+    assert other[0] != "Accepted"
+
+
+def test_flat_floor_account_still_respects_its_floor_and_the_discount_band():
+    # An offer below the 2% floor is countered, never accepted, and the counter still
+    # clears 2% and stays inside the 5-10% discount band.
+    action, counter, pct = script.decide_offer(
+        50, 100, 50, 40, "N/A", False, SETTINGS, False, FLAT_ACCOUNT
+    )
+    assert action == "Counteroffer"
+    assert pct >= SETTINGS[script.flat_floor_key(FLAT_ACCOUNT)]
+    assert 100 * 0.90 <= counter <= 100 * 0.95
 
 
 def test_expired_offer():

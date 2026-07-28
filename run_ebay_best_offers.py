@@ -10,6 +10,9 @@ Runs once a day at 17:30 local time. Each run:
    every buyer offer from the eBay Trading API (GetBestOffers, across all pages),
    and enriches from SQL (site cost, weight, aged status).          [Step 3]
 3. Decides Accept / Counteroffer / Decline (or skips) per offer.    [Step 2]
+   The minimum-profit floor is per item (default, eased for Slow / Dead / below-cost
+   SKUs), except on the accounts configured in FLAT_MIN_PROFIT_ACCOUNTS, which use one
+   flat floor for every item regardless of age.
 4. Answers each offer (Accept / Counter / Decline) via RespondToBestOffer when
    ACT_ON_OFFERS is enabled; otherwise a dry run just logs the intent.  [Step 6]
 5. Writes the full result set to SQL and sends a summary email with the
@@ -81,6 +84,45 @@ SETTINGS = {
     "minimum estimated shipping":            ("shipping_floor",             0.00, 100.0, "usd"),
 }
 
+# Accounts priced to one flat floor instead of the aged tiers: {account: workbook label}.
+# Read from gitignored config, because this repo is public and both the internal account
+# name and its margin are business-sensitive. Shape in config/accounts.json:
+#   "flat_min_profit_accounts": {"<account>": "<settings workbook label>"}
+# Each configured label becomes a required workbook value, so a missing cell stops the
+# run exactly like any other setting rather than silently pricing at the default floor.
+FLAT_MIN_PROFIT_ACCOUNTS: dict[str, str] = {
+    account: str(label).strip().lower()
+    for account, label in load_config_safe(
+        CONFIG_DIR / "accounts.json").get("flat_min_profit_accounts", {}).items()
+}
+
+
+def flat_floor_key(account: str) -> str:
+    """The settings key holding one account's flat minimum-profit floor."""
+    return f"flat_min_profit::{account}"
+
+
+def settings_spec() -> dict:
+    """:data:`SETTINGS` plus one required floor per flat-floor account."""
+    spec = dict(SETTINGS)
+    for account, label in FLAT_MIN_PROFIT_ACCOUNTS.items():
+        spec[label] = (flat_floor_key(account), 0.00, 0.50, "pct")
+    return spec
+
+
+def flat_floor_summary(settings: dict, separator: str = ", ") -> str:
+    """Name each flat-floor account and its floor, for the log and the email footer.
+
+    Empty when no account is configured, so the surrounding sentence still reads
+    correctly on a fleet with no flat-floor account.
+    """
+    parts = [
+        f"{account} {settings[flat_floor_key(account)]:.1%} on every item"
+        for account in FLAT_MIN_PROFIT_ACCOUNTS
+        if flat_floor_key(account) in settings
+    ]
+    return f"{separator}{'; '.join(parts)}" if parts else ""
+
 
 def read_settings(path: str) -> tuple[dict, list[str]]:
     """Read the settings workbook with pandas and check the values.
@@ -128,7 +170,7 @@ def check_settings(entered: dict) -> tuple[dict, list[str]]:
     settings = {}
     problems = []
 
-    for label, (name, low, high, kind) in SETTINGS.items():
+    for label, (name, low, high, kind) in settings_spec().items():
         if kind == "usd":
             expected = f"a dollar amount between ${low:,.0f} and ${high:,.0f}"
         else:
@@ -481,14 +523,21 @@ def margin(price: float, total_cost: float, commission: float) -> float:
     return (price - total_cost - price * commission) / price
 
 
-def effective_min_profit(aged_status: str, sell_below_cost: bool, settings: dict) -> float:
+def effective_min_profit(aged_status: str, sell_below_cost: bool, settings: dict,
+                         account: str = "") -> float:
     """The lowest minimum-profit floor that applies to one item.
 
     Starts at the default and eases to the more permissive floor for a Slow / Dead
     aged item or a EnableSellingBelowCost SKU, so flagged inventory can be countered deeper.
     When several apply, the lowest (most permissive) wins. All floors come from the
     settings workbook.
+
+    An account in :data:`FLAT_MIN_PROFIT_ACCOUNTS` skips all of that and uses its own
+    flat floor for every item, aged or not.
     """
+    if account in FLAT_MIN_PROFIT_ACCOUNTS:
+        return settings[flat_floor_key(account)]
+
     floors = [settings["min_profit"]]
     aged = str(aged_status).strip().lower()
     if aged == "slow":
@@ -502,7 +551,7 @@ def effective_min_profit(aged_status: str, sell_below_cost: bool, settings: dict
 
 def decide_offer(cx_offer: float, current_price: float, site_cost: float,
                  weight_oz: float, aged_status: str, sell_below_cost: bool, settings: dict,
-                 out_of_stock: bool = False) -> tuple[str, float, float]:
+                 out_of_stock: bool = False, account: str = "") -> tuple[str, float, float]:
     """Decide what to do with one buyer offer.
 
     Args:
@@ -515,6 +564,8 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
         settings: The control-workbook settings.
         out_of_stock: The listing has no sellable quantity — eBay blocks Accept and
             Counter on it, so we skip it rather than send a doomed response.
+        account: The seller account, so one in :data:`FLAT_MIN_PROFIT_ACCOUNTS` uses its
+            flat floor instead of the aged tiers.
 
     Returns:
         ``(action, counter_price, profit_pct)``:
@@ -532,7 +583,7 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
         return ("Missing Site Cost", 0.0, 0.0)
 
     commission = settings["commission"]
-    min_profit = effective_min_profit(aged_status, sell_below_cost, settings)
+    min_profit = effective_min_profit(aged_status, sell_below_cost, settings, account)
     total_cost = site_cost + est_shipping(weight_oz)
 
     # The buyer's own offer already clears the margin — accept it.
@@ -959,7 +1010,8 @@ def build_results(offers: pd.DataFrame, settings: dict) -> pd.DataFrame:
 
         action, counter_price, _ = decide_offer(
             row.cx_offer, row.current_price, row.site_cost, row.weight_oz,
-            row.aged_status, row.sell_below_cost, settings, bool(row.out_of_stock)
+            row.aged_status, row.sell_below_cost, settings, bool(row.out_of_stock),
+            row.account
         )
         # buyer_margin only means something when the offer is actually priceable.
         priceable = row.cx_offer > 0 and row.site_cost not in (0, 0.01)
@@ -1173,7 +1225,8 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
         "<p style='font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#555'>"
         f"Rules used: commission {settings['commission']:.1%}; minimum profit {settings['min_profit']:.1%} "
         f"(Slow {settings['slow_min_profit']:.1%}, Dead {settings['dead_min_profit']:.1%}, "
-        f"enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%}); counter discount band "
+        f"enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%})"
+        f"{flat_floor_summary(settings, separator='; ')}; counter discount band "
         f"{settings['min_discount']:.0%} to {settings['max_discount']:.0%}; shipping estimated "
         "by item weight.</p>"
     )
@@ -1276,7 +1329,8 @@ def main() -> None:
     log.success(
         f"Settings loaded — commission {settings['commission']:.1%}, "
         f"min profit {settings['min_profit']:.1%} (Slow {settings['slow_min_profit']:.1%}, "
-        f"Dead {settings['dead_min_profit']:.1%}, enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%}), "
+        f"Dead {settings['dead_min_profit']:.1%}, enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%})"
+        f"{flat_floor_summary(settings)}, "
         f"discount band {settings['min_discount']:.0%}-{settings['max_discount']:.0%}, "
         "shipping estimated by item weight."
     )
