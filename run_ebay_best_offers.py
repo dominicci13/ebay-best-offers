@@ -279,6 +279,11 @@ return Array.from(document.querySelectorAll("tr.grid-row[data-id]")).map(r => [
 ]);
 """
 
+# eBay's own "no results" element. It is rendered only when the filter matched
+# nothing, and is absent (not hidden) whenever the grid has rows, which is what
+# lets an empty account be told apart from a broken row selector.
+ZERO_RESULTS_SELECTOR = ".zeroResultsMessage"
+
 
 def offers_to_frame(rows: list, account: str, today: str) -> pd.DataFrame:
     """Shape the raw grid rows into the offers table.
@@ -320,10 +325,12 @@ def scrape_pending_offers(driver: object, account: str, today: str) -> pd.DataFr
 
     Returns:
         The account's offers as a DataFrame (see :func:`offers_to_frame`); empty
-        if the account has no pending offers.
+        if the account has no pending offers, which eBay reports with a
+        zero-results message rather than by omitting the table.
 
     Raises:
-        RuntimeError: If the grid renders but no rows are read (DOM changed).
+        RuntimeError: If the grid renders with neither offer rows nor a
+            zero-results message, meaning the row selector no longer matches.
     """
     driver.get(PENDING_OFFERS_URL)
     driver.switch_to_window(0)
@@ -339,6 +346,13 @@ def scrape_pending_offers(driver: object, account: str, today: str) -> pd.DataFr
 
     rows = driver.execute_script(EXTRACT_OFFERS_JS)
     if not rows:
+        # eBay renders the table shell (headers and summary bar) even when nothing
+        # matches, so an account with no offers lands here instead of the timeout
+        # above. Trust eBay's own zero-results element over an empty row list: no
+        # element means the rows really are missing and the run should fail loudly.
+        if driver.find_elements(By.CSS_SELECTOR, ZERO_RESULTS_SELECTOR):
+            log.info(f"No pending offers for [cyan]{account}[/cyan].")
+            return offers_to_frame([], account, today)
         save_debug_screenshot(driver, root=account, section="scrape", description="no_offer_rows")
         raise RuntimeError("Pending-offers grid rendered but no rows were read — the eBay layout may have changed.")
 
