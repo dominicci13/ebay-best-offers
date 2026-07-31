@@ -120,6 +120,52 @@ def test_decline_when_even_shallow_discount_cannot_clear():
     assert counter == 0.0
 
 
+def test_our_own_outstanding_counteroffer_is_never_answered():
+    # GetBestOffers returns our own live counteroffer alongside the buyer's offers. Its
+    # price was built to clear the floor, so pricing it as a buyer offer always says
+    # "Accepted" — and eBay rejects that with 21940 (you can't accept your own offer).
+    action, counter, _ = script.decide_offer(
+        90, 100, 50, 40, "N/A", False, SETTINGS, False, "", "SellerCounterOffer"
+    )
+    assert action == "Awaiting Buyer"
+    assert counter == 0.0
+
+
+def test_the_7_30_deals_drop_rejection_reproduces_and_is_fixed():
+    # The exact row behind 21940 on 7/29 and 7/30: our $920.69 counter (10% off $1,022.99)
+    # read back as an offer, 6.73% margin against a 2% flat floor -> "Accepted".
+    args = (920.69, 1022.99, 733.27, 0, "N/A", False, SETTINGS, False, FLAT_ACCOUNT)
+    assert script.decide_offer(*args)[0] == "Accepted"          # today's wrong answer
+    assert script.decide_offer(*args, "SellerCounterOffer")[0] == "Awaiting Buyer"
+
+
+def test_buyer_codes_are_answered_normally():
+    for code in ("BuyerBestOffer", "BuyerCounterOffer"):
+        action, _, _ = script.decide_offer(200, 250, 100, 32, "N/A", False, SETTINGS, False, "", code)
+        assert action == "Accepted", code
+
+
+def test_a_missing_code_still_answers_so_real_offers_are_never_dropped():
+    # No code means no evidence the offer is ours; skipping it would cost a sale.
+    action, _, _ = script.decide_offer(200, 250, 100, 32, "N/A", False, SETTINGS, False, "", "")
+    assert action == "Accepted"
+
+
+def test_expired_wins_over_awaiting_buyer():
+    # A no-offer row carries no code; it must stay Expired, not become Awaiting Buyer.
+    action, _, _ = script.decide_offer(0, 100, 50, 100, "N/A", False, SETTINGS, False, "", "")
+    assert action == "Expired Offer"
+
+
+def test_awaiting_buyer_wins_over_out_of_stock_and_missing_cost():
+    # It isn't our offer to answer at all — that outranks the other skip reasons.
+    for oos, cost in ((True, 50), (False, 0)):
+        action, _, _ = script.decide_offer(
+            90, 100, cost, 40, "N/A", False, SETTINGS, oos, "", "SellerCounterOffer"
+        )
+        assert action == "Awaiting Buyer"
+
+
 def test_dead_and_sell_below_cost_accept_where_normal_would_not():
     # weight 40 oz -> $10 shipping, site_cost 50 -> total_cost 60; offer 74 yields
     # ~6.9% margin: clears the 4% Dead / below-cost floor but not the 9% default

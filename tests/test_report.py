@@ -4,6 +4,7 @@ from __future__ import annotations
 import pandas as pd
 
 import run_ebay_best_offers as script
+from conftest import FLAT_ACCOUNT
 
 SETTINGS = {
     "commission": 0.12,
@@ -20,13 +21,13 @@ SETTINGS = {
 # A counter, an accept, a decline; one account name carries an ampersand (must escape).
 OFFERS = pd.DataFrame(
     [
-        ("2026-07-07", "Acme & Co", "Cold CS-22C", "CS-22C&X", 109.99, "111", False, 69.17, 40.0, "N/A", 90.0, False, "b-111", 1),
-        ("2026-07-07", "Acme & Co", "Sony A7", "SNY", 250.00, "222", False, 100.00, 32.0, "Slow", 200.0, False, "b-222", 1),
-        ("2026-07-07", "Account Two", "Kodak EKMSD", "EK", 24.29, "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1),
+        ("2026-07-07", "Acme & Co", "Cold CS-22C", "CS-22C&X", 109.99, "111", False, 69.17, 40.0, "N/A", 90.0, False, "b-111", 1, "BuyerBestOffer"),
+        ("2026-07-07", "Acme & Co", "Sony A7", "SNY", 250.00, "222", False, 100.00, 32.0, "Slow", 200.0, False, "b-222", 1, "BuyerBestOffer"),
+        ("2026-07-07", "Account Two", "Kodak EKMSD", "EK", 24.29, "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1, "BuyerBestOffer"),
     ],
     columns=["date", "account", "title", "sku", "current_price", "item_number",
              "out_of_stock", "site_cost", "weight_oz", "aged_status", "cx_offer",
-             "sell_below_cost", "best_offer_id", "offer_quantity"],
+             "sell_below_cost", "best_offer_id", "offer_quantity", "offer_code"],
 )
 RESULTS = script.build_results(OFFERS, SETTINGS)
 
@@ -103,13 +104,30 @@ def test_banner_singular_for_one_failed_account():
 
 WITH_EXPIRED = pd.DataFrame(
     [
-        ("2026-07-27", "Solo", "Sony A7", "SNY", 250.00, "222", False, 100.00, 32.0, "N/A", 200.0, False, "b-222", 1),
-        ("2026-07-27", "Solo", "Kodak EK", "EK", 24.29, "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1),
-        ("2026-07-27", "Solo", "Nikon Z", "NZ", 500.00, "555", False, 200.00, 30.0, "N/A", 450.0, False, "b-555", 1),
-        ("2026-07-27", "Solo", "Gone", "GX", 100.00, "444", False, 50.00, 40.0, "N/A", 0.0, False, None, 1),
+        ("2026-07-27", "Solo", "Sony A7", "SNY", 250.00, "222", False, 100.00, 32.0, "N/A", 200.0, False, "b-222", 1, "BuyerBestOffer"),
+        ("2026-07-27", "Solo", "Kodak EK", "EK", 24.29, "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1, "BuyerBestOffer"),
+        ("2026-07-27", "Solo", "Nikon Z", "NZ", 500.00, "555", False, 200.00, 30.0, "N/A", 450.0, False, "b-555", 1, "BuyerBestOffer"),
+        ("2026-07-27", "Solo", "Gone", "GX", 100.00, "444", False, 50.00, 40.0, "N/A", 0.0, False, None, 1, ""),
     ],
     columns=OFFERS.columns,
 )
+
+
+def test_awaiting_buyer_is_its_own_column_not_a_phantom_accept():
+    # The real 7/30 row: our own $920.69 counter on a 2% flat-floor account, which used
+    # to read "Accepted" and tell the business we had accepted an offer eBay rejected.
+    ours = pd.DataFrame(
+        [("2026-07-30", FLAT_ACCOUNT, "Our Counter", "OWN", 1022.99, "888", False,
+          733.27, 0.0, "N/A", 920.69, False, "b-888", 1, "SellerCounterOffer")],
+        columns=OFFERS.columns,
+    )
+    results = script.build_results(ours, SETTINGS)
+    assert list(results["action"]) == ["Awaiting Buyer"]   # not "Accepted"
+
+    body = script.build_summary_email(results, SETTINGS)
+    assert "Awaiting Buyer" in body                        # its own column, counted honestly
+    totals_row = body.rsplit("<tr>", 1)[1]
+    assert ">1<" in totals_row
 
 
 def test_expired_is_not_a_column():

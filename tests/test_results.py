@@ -25,18 +25,19 @@ SETTINGS = {
 # One row per outcome. Columns match an enriched offer with the API offer attached.
 OFFERS = pd.DataFrame(
     [
-        # date, account, title, sku, current_price, item_number, out_of_stock, site_cost, weight_oz, aged_status, cx_offer, sell_below_cost, best_offer_id, offer_quantity
-        ("2026-07-02", "Acct1", "Cold CS-22C",  "CS-22C", 109.99, "111", False, 69.17, 40.0, "N/A", 90.0, False, "b-111", 1),    # counter
-        ("2026-07-02", "Acct1", "Sony A7",      "SNY",    250.00, "222", False, 100.00, 32.0, "Slow", 200.0, False, "b-222", 1), # accept
-        ("2026-07-02", "Acct1", "Kodak EKMSD",  "EKMSD",  24.29,  "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1),    # decline
-        ("2026-07-02", "Acct1", "Sony Expired", "SZ",     100.00, "444", True,  50.00, 40.0, "N/A", 0.0, False, None, 1),        # expired
-        ("2026-07-02", "Acct1", "Sony NoCost",  "SQ",     100.00, "555", False, 0.00,  40.0, "N/A", 80.0, False, "b-555", 1),    # missing cost
-        ("2026-07-02", "Acct1", "Dead Item",    "DED",    3849.0, "666", False, 2800.0, 640.0, "Dead", 3500.0, False, "b-666", 1), # dead accepts
-        ("2026-07-02", "Acct1", "OOS Item",     "OOS",    200.00, "777", True,  120.00, 40.0, "N/A", 150.0, False, "b-777", 1),  # out of stock
+        # date, account, title, sku, current_price, item_number, out_of_stock, site_cost, weight_oz, aged_status, cx_offer, sell_below_cost, best_offer_id, offer_quantity, offer_code
+        ("2026-07-02", "Acct1", "Cold CS-22C",  "CS-22C", 109.99, "111", False, 69.17, 40.0, "N/A", 90.0, False, "b-111", 1, "BuyerBestOffer"),    # counter
+        ("2026-07-02", "Acct1", "Sony A7",      "SNY",    250.00, "222", False, 100.00, 32.0, "Slow", 200.0, False, "b-222", 1, "BuyerBestOffer"), # accept
+        ("2026-07-02", "Acct1", "Kodak EKMSD",  "EKMSD",  24.29,  "333", False, 35.64, 40.0, "N/A", 20.0, False, "b-333", 1, "BuyerBestOffer"),    # decline
+        ("2026-07-02", "Acct1", "Sony Expired", "SZ",     100.00, "444", True,  50.00, 40.0, "N/A", 0.0, False, None, 1, ""),                      # expired
+        ("2026-07-02", "Acct1", "Sony NoCost",  "SQ",     100.00, "555", False, 0.00,  40.0, "N/A", 80.0, False, "b-555", 1, "BuyerBestOffer"),    # missing cost
+        ("2026-07-02", "Acct1", "Dead Item",    "DED",    3849.0, "666", False, 2800.0, 640.0, "Dead", 3500.0, False, "b-666", 1, "BuyerBestOffer"), # dead accepts
+        ("2026-07-02", "Acct1", "OOS Item",     "OOS",    200.00, "777", True,  120.00, 40.0, "N/A", 150.0, False, "b-777", 1, "BuyerBestOffer"),  # out of stock
+        ("2026-07-02", "Acct1", "Our Counter",  "OWN",    1022.99, "888", False, 733.27, 0.0, "N/A", 920.69, False, "b-888", 1, "SellerCounterOffer"), # awaiting buyer
     ],
     columns=["date", "account", "title", "sku", "current_price", "item_number",
              "out_of_stock", "site_cost", "weight_oz", "aged_status", "cx_offer",
-             "sell_below_cost", "best_offer_id", "offer_quantity"],
+             "sell_below_cost", "best_offer_id", "offer_quantity", "offer_code"],
 )
 
 
@@ -101,6 +102,16 @@ def test_out_of_stock_row_is_skipped_no_counter():
     assert pd.isna(row.counter_margin)
 
 
+def test_our_own_counteroffer_is_recorded_but_never_answered():
+    # Priced as a buyer offer this clears the floor and would read "Accepted" — the row
+    # eBay rejected with 21940 on 7/29 and 7/30. It is archived, never sent.
+    row = _by_item()["888"]
+    assert row.action == "Awaiting Buyer"
+    assert pd.isna(row.counter)
+    assert pd.isna(row.counter_margin)
+    assert row.action not in script.RESPOND_ACTIONS   # nothing goes to eBay
+
+
 def test_dead_item_accepts_below_default_margin():
     row = _by_item()["666"]
     assert row.action == "Accepted"
@@ -137,6 +148,37 @@ def test_attach_api_offers_expands_multiple_offers_per_item():
     assert set(out["offer_quantity"]) == {1, 2}
 
 
+def test_attach_api_offers_carries_the_offer_code():
+    """Drop the code and we can't tell our own counteroffer from a buyer's offer."""
+    grid = pd.DataFrame(
+        [("2026-07-02", "Acct1", "Mixed", "SKU-X", 100.00, "902", False, 50.0, 40.0, "N/A", False)],
+        columns=_GRID_COLS,
+    )
+    api_offers = [
+        {"item_number": "902", "cx_offer": 60.0, "best_offer_id": "A", "quantity": 1,
+         "code": "BuyerBestOffer"},
+        {"item_number": "902", "cx_offer": 90.0, "best_offer_id": "B", "quantity": 1,
+         "code": "SellerCounterOffer"},
+    ]
+    out = script.attach_api_offers(grid, api_offers)
+    assert dict(zip(out["best_offer_id"], out["offer_code"])) == {
+        "A": "BuyerBestOffer", "B": "SellerCounterOffer"
+    }
+    # ...and the code must reach the decision, or the whole guard is a no-op.
+    rows = {r.best_offer_id: r for r in script.build_results(out, SETTINGS).itertuples(index=False)}
+    assert rows["A"].action != "Awaiting Buyer"
+    assert rows["B"].action == "Awaiting Buyer"
+
+
+def test_attach_api_offers_no_offer_has_an_empty_code():
+    grid = pd.DataFrame(
+        [("2026-07-02", "Acct1", "None", "SKU-N", 100.00, "903", False, 50.0, 40.0, "N/A", False)],
+        columns=_GRID_COLS,
+    )
+    out = script.attach_api_offers(grid, [])
+    assert out.iloc[0]["offer_code"] == ""   # no offer, no code — must not read as Awaiting Buyer
+
+
 def test_attach_api_offers_no_offer_reads_as_expired():
     grid = pd.DataFrame(
         [("2026-07-02", "Acct1", "None", "SKU-N", 100.00, "901", False, 50.0, 40.0, "N/A", False)],
@@ -155,9 +197,9 @@ def test_account_reaches_the_decision_so_a_flat_floor_account_gets_its_floor():
     account silently keeps the 9% default and the whole rule is a no-op."""
     same_offer = [
         ("2026-07-02", FLAT_ACCOUNT, "Flat", "F1", 100.00, "801", False,
-         50.00, 40.0, "Dead", 70.0, False, "b-801", 1),
+         50.00, 40.0, "Dead", 70.0, False, "b-801", 1, "BuyerBestOffer"),
         ("2026-07-02", "SomeOtherAccount", "Flat", "F1", 100.00, "802", False,
-         50.00, 40.0, "Dead", 70.0, False, "b-802", 1),
+         50.00, 40.0, "Dead", 70.0, False, "b-802", 1, "BuyerBestOffer"),
     ]
     frame = pd.DataFrame(same_offer, columns=OFFERS.columns)
     rows = {r.item_number: r for r in script.build_results(frame, SETTINGS).itertuples(index=False)}

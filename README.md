@@ -34,7 +34,7 @@ append-only archive** that never loses a day.
    Offers are matched onto the scraped rows by item number, one row per offer, so a
    listing with several offers has all of them handled.
 5. **Decide** per offer: Accept, Counteroffer, or Decline, or a skip reason
-   (Expired Offer, Out of Stock, Missing Site Cost).
+   (Expired Offer, Awaiting Buyer, Out of Stock, Missing Site Cost).
 6. **Answer** each offer on eBay (`RespondToBestOffer`) — Accept, send the
    counteroffer with its buyer message, or Decline with its message. Gated behind
    `ACT_ON_OFFERS`: off, it logs the intended action and sends nothing.
@@ -73,13 +73,22 @@ is a pure function from the offer's numbers to `(action, counter_price, margin)`
 For each offer it tests, in order:
 
 1. **Expired Offer** — the buyer's offer is no longer readable.
-2. **Out of Stock** — the listing has no sellable quantity, so eBay would block an
+2. **Awaiting Buyer** — the offer is our own counteroffer, still outstanding. eBay
+   returns it alongside the buyer's offers, and its price was built to clear the
+   floor, so priced as a buyer's offer it always reads as an Accept — which eBay
+   rejects (`21940`, or `21913` on a re-counter). Recorded and shown, never answered.
+3. **Out of Stock** — the listing has no sellable quantity, so eBay would block an
    Accept/Counter; the offer is recorded and shown but never answered.
-3. **Missing Site Cost** — the SKU has no cost in SQL (the `0` / `0.01` sentinel).
-4. **Accepted** — the buyer's own offer already clears the minimum profit floor.
-5. **Counteroffer** — the biggest discount within the allowed band that still
+4. **Missing Site Cost** — the SKU has no cost in SQL (the `0` / `0.01` sentinel).
+5. **Accepted** — the buyer's own offer already clears the minimum profit floor.
+6. **Counteroffer** — the biggest discount within the allowed band that still
    clears the floor (the best price for the buyer that still protects us).
-6. **Declined** — even the shallowest allowed discount can't clear the floor.
+7. **Declined** — even the shallowest allowed discount can't clear the floor.
+
+The buyer/seller split comes from eBay's `BestOfferCodeType`: a code starting with
+`Buyer` is the buyer's to answer, anything else is ours. A missing code answers as
+before — dropping a real buyer offer costs a sale, while answering one of ours only
+earns a rejected API call.
 
 The **minimum profit floor is per-item**: the default, eased to a lower floor for
 Slow / Dead aged items or an EnableSellingBelowCost SKU (the lowest applicable wins), so

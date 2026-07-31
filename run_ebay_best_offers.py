@@ -12,7 +12,9 @@ Runs once a day at 17:30 local time. Each run:
 3. Decides Accept / Counteroffer / Decline (or skips) per offer.    [Step 2]
    The minimum-profit floor is per item (default, eased for Slow / Dead / below-cost
    SKUs), except on the accounts configured in FLAT_MIN_PROFIT_ACCOUNTS, which use one
-   flat floor for every item regardless of age.
+   flat floor for every item regardless of age. Our own outstanding counteroffers come
+   back in that read and are skipped as "Awaiting Buyer" — eBay rejects any attempt to
+   answer them.
 4. Answers each offer (Accept / Counter / Decline) via RespondToBestOffer when
    ACT_ON_OFFERS is enabled; otherwise a dry run just logs the intent.  [Step 6]
 5. Writes the full result set to SQL and sends a summary email with the
@@ -563,9 +565,31 @@ def effective_min_profit(aged_status: str, sell_below_cost: bool, settings: dict
     return min(floors)
 
 
+# eBay's BestOfferCodeType is BuyerBestOffer / BuyerCounterOffer for the buyer's side
+# and SellerCounterOffer for ours. GetBestOffers returns our own counteroffer while it is
+# still outstanding, and its price was built to clear the floor — so priced as if it were
+# a buyer's offer it always reads as Accept, which eBay then rejects (21940 "not
+# authorized", or 21913 "wait for the buyer" on a re-counter). Match on the side rather
+# than the exact value so eBay's variant codes (…WithSIF) are classified correctly too.
+BUYER_CODE_PREFIX = "Buyer"
+
+
+def is_buyer_offer(offer_code: str | None) -> bool:
+    """Is this offer the buyer's to answer, rather than our own counteroffer?
+
+    An empty or missing code means the read told us nothing, so we answer as before —
+    dropping a real buyer offer costs a sale, while answering one of ours only earns a
+    rejected API call.
+    """
+    if offer_code is None or offer_code == "":
+        return True
+    return str(offer_code).startswith(BUYER_CODE_PREFIX)
+
+
 def decide_offer(cx_offer: float, current_price: float, site_cost: float,
                  weight_oz: float, aged_status: str, sell_below_cost: bool, settings: dict,
-                 out_of_stock: bool = False, account: str = "") -> tuple[str, float, float]:
+                 out_of_stock: bool = False, account: str = "",
+                 offer_code: str = "") -> tuple[str, float, float]:
     """Decide what to do with one buyer offer.
 
     Args:
@@ -580,17 +604,22 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
             Counter on it, so we skip it rather than send a doomed response.
         account: The seller account, so one in :data:`FLAT_MIN_PROFIT_ACCOUNTS` uses its
             flat floor instead of the aged tiers.
+        offer_code: eBay's ``BestOfferCodeType`` for this offer. Anything that isn't a
+            buyer code is our own outstanding counteroffer, which we must not answer.
+            Empty means the read carried no code — answer it normally.
 
     Returns:
         ``(action, counter_price, profit_pct)``:
-          action - Expired Offer / Out of Stock / Missing Site Cost / Accepted /
-                   Counteroffer / Declined.
+          action - Expired Offer / Awaiting Buyer / Out of Stock / Missing Site Cost /
+                   Accepted / Counteroffer / Declined.
           counter_price - the price to counter at (0.0 unless it's a Counteroffer).
           profit_pct - our margin at the acted price (0.0 for skip / decline).
     """
     # Cases where we can't safely act on the offer — skip with the reason why.
     if cx_offer <= 0:
         return ("Expired Offer", 0.0, 0.0)  # was pending at scrape time, now unreadable = expired/withdrawn
+    if not is_buyer_offer(offer_code):
+        return ("Awaiting Buyer", 0.0, 0.0)  # our own live counteroffer; eBay rejects answering it (21940/21913)
     if out_of_stock:
         return ("Out of Stock", 0.0, 0.0)   # can't fulfill; a counter/accept would fail at eBay (err 21922)
     if site_cost == 0 or site_cost == 0.01:
@@ -624,8 +653,9 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
 # =============================================================================
 # READ OFFERS via the eBay Trading API (GetBestOffers)                 [Step 3]
 # =============================================================================
-# GetBestOffers returns every active best offer for an account (item, amount,
-# BestOfferID); we page through all results because eBay caps the page size, so
+# GetBestOffers returns every active best offer for an account (item, amount, BestOfferID,
+# BestOfferCodeType) — including our OWN outstanding counteroffers, so the code is what
+# says whose offer it is. We page through all results because eBay caps the page size, so
 # reading only page 1 would silently drop later offers. It's a server API with no
 # browser, so eBay's bot check never fires. This replaces the old per-item browser
 # read. Good candidate to promote into seller_automation_utils. Buyer identity in
@@ -758,9 +788,10 @@ def get_best_offers(token: str) -> list[dict]:
 # One RespondToBestOffer call per answered offer. Safe by default: nothing is sent
 # unless ACT_ON_OFFERS is truthy in the environment. With the flag off the run is a
 # dry run — it logs the action it would take and sends nothing, so even a scheduled
-# run can't answer a buyer before the business signs off. Once an offer is answered
-# it leaves eBay's Active set, so a later GetBestOffers won't return it again — a
-# rerun can't double-answer.
+# run can't answer a buyer before the business signs off. An accepted or declined offer
+# leaves eBay's Active set, so a later GetBestOffers won't return it again. A COUNTER
+# does come back — as our own outstanding counteroffer, which is why every row is
+# checked against its BestOfferCodeType before we answer it (see is_buyer_offer).
 
 RESPOND_ACTIONS = {"Accepted": "Accept", "Counteroffer": "Counter", "Declined": "Decline"}
 
@@ -890,7 +921,8 @@ def respond_to_offers(results: pd.DataFrame, token: str, settings: dict, live: b
     Walks the decided rows and, for every Accept / Counter / Decline, sends one
     RespondToBestOffer using that row's ``BestOfferID``. One listing can carry
     several offers, so each row (each offer) is answered on its own. Skip reasons
-    (Expired Offer, Missing Site Cost) are never sent. With ``live`` false nothing is
+    (Expired Offer, Awaiting Buyer, Out of Stock, Missing Site Cost) are never sent —
+    they have no entry in :data:`RESPOND_ACTIONS`. With ``live`` false nothing is
     sent — each intended action is logged instead. A single offer's failure (a bad
     ack or a network error) is logged and skipped so the rest still go through.
 
@@ -910,7 +942,7 @@ def respond_to_offers(results: pd.DataFrame, token: str, settings: dict, live: b
     for row in results.itertuples(index=False):
         ebay_action = RESPOND_ACTIONS.get(row.action)
         if ebay_action is None:
-            continue  # Expired Offer / Missing Site Cost — nothing to send
+            continue  # a skip reason (Expired / Awaiting Buyer / OOS / Missing Cost) — nothing to send
         best_offer_id = row.best_offer_id
         if pd.isna(best_offer_id) or not best_offer_id:
             log.warning(f"No BestOfferID for {row.account}/{row.item_number} — cannot {ebay_action}; skipped.")
@@ -965,15 +997,19 @@ def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFr
     offer keeps a single row with ``cx_offer`` 0 (it reads as an expired offer)
     and ``best_offer_id`` None. Buyer identity is never carried across.
 
+    ``offer_code`` (eBay's ``BestOfferCodeType``) comes across too: the account's
+    offers include our own outstanding counteroffers, and only the code tells them
+    apart (see :func:`is_buyer_offer`).
+
     Args:
         offers: The enriched grid, one row per listing.
         api_offers: :func:`get_best_offers` output — one dict per active offer.
 
     Returns:
         The offers table expanded to one row per offer, with ``cx_offer``,
-        ``best_offer_id`` and ``offer_quantity`` columns added.
+        ``best_offer_id``, ``offer_quantity`` and ``offer_code`` columns added.
     """
-    cols = ["item_number", "cx_offer", "best_offer_id", "offer_quantity"]
+    cols = ["item_number", "cx_offer", "best_offer_id", "offer_quantity", "offer_code"]
     if api_offers:
         api_df = pd.DataFrame([
             {
@@ -981,6 +1017,7 @@ def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFr
                 "cx_offer": o["cx_offer"],
                 "best_offer_id": o["best_offer_id"],
                 "offer_quantity": o.get("quantity", 1),
+                "offer_code": o.get("code") or "",
             }
             for o in api_offers
         ])
@@ -991,6 +1028,7 @@ def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFr
     merged["cx_offer"] = pd.to_numeric(merged["cx_offer"], errors="coerce").fillna(0.0)
     merged["offer_quantity"] = pd.to_numeric(merged["offer_quantity"], errors="coerce").fillna(1).astype(int)
     merged["best_offer_id"] = merged["best_offer_id"].where(merged["best_offer_id"].notna(), None)  # NaN -> None for no-offer rows
+    merged["offer_code"] = merged["offer_code"].fillna("")  # no-offer rows must not read as "not the buyer's"
     return merged
 
 
@@ -1005,9 +1043,9 @@ def build_results(offers: pd.DataFrame, settings: dict) -> pd.DataFrame:
     misleading 0.
 
     Args:
-        offers: One row per offer, with ``cx_offer``, ``best_offer_id`` and
-            ``offer_quantity`` columns (see :func:`enrich_offers` and
-            :func:`attach_api_offers`).
+        offers: One row per offer, with ``cx_offer``, ``best_offer_id``,
+            ``offer_quantity`` and ``offer_code`` columns (see :func:`enrich_offers`
+            and :func:`attach_api_offers`).
         settings: The control-workbook settings.
 
     Returns:
@@ -1025,7 +1063,7 @@ def build_results(offers: pd.DataFrame, settings: dict) -> pd.DataFrame:
         action, counter_price, _ = decide_offer(
             row.cx_offer, row.current_price, row.site_cost, row.weight_oz,
             row.aged_status, row.sell_below_cost, settings, bool(row.out_of_stock),
-            row.account
+            row.account, row.offer_code
         )
         # buyer_margin only means something when the offer is actually priceable.
         priceable = row.cx_offer > 0 and row.site_cost not in (0, 0.01)
@@ -1148,7 +1186,7 @@ def remove_run_results(conn: object, accounts: list[str], today: str) -> None:
 # table shows so the row always adds up.
 REPORT_ACTIONS = [
     "Accepted", "Counteroffer", "Declined",
-    "Out of Stock", "Missing Site Cost",
+    "Awaiting Buyer", "Out of Stock", "Missing Site Cost",
 ]
 
 # Short column headers for the email summary table (the SQL/action names run long).
@@ -1156,6 +1194,7 @@ ACTION_LABELS = {
     "Accepted": "Accepted",
     "Counteroffer": "Counter",
     "Declined": "Declined",
+    "Awaiting Buyer": "Awaiting Buyer",
     "Out of Stock": "Out of Stock",
     "Missing Site Cost": "Missing Cost",
 }
@@ -1411,6 +1450,16 @@ def main() -> None:
                 # active offer becomes one row with cx_offer 0 -> Expired Offer.
                 token = get_env(_token_env(account), required=True)
                 api_offers = get_best_offers(token)
+
+                # The account's offers include our own outstanding counteroffers, which we
+                # must not answer. Name the codes we're skipping so the log carries eBay's
+                # actual value rather than our assumption about it.
+                not_ours_to_answer = sorted({
+                    str(o.get("code")) for o in api_offers if not is_buyer_offer(o.get("code"))
+                })
+                if not_ours_to_answer:
+                    log.info(f"Skipping offers that aren't the buyer's: {', '.join(not_ours_to_answer)}.")
+
                 offers = attach_api_offers(offers, api_offers)
 
                 results = build_results(offers, settings)
