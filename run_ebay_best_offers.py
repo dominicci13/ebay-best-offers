@@ -6,9 +6,9 @@ Runs once a day at 17:30 local time. Each run:
    discount band) from the control workbook. If a setting is missing or invalid,
    the run stops and emails the business team what to fix, so no offer is ever
    sent using a wrong number.
-2. Scrapes each seller account's pending Best Offers (Seller Hub grid), reads
-   every buyer offer from the eBay Trading API (GetBestOffers, across all pages),
-   and enriches from SQL (site cost, weight, aged status).          [Step 3]
+2. Reads every buyer offer from the eBay Trading API (GetBestOffers, across all
+   pages), reads each offered listing with GetItem (SKU, price, stock), and
+   enriches from SQL (site cost, weight, aged status).              [Step 3]
 3. Decides Accept / Counteroffer / Decline (or skips) per offer.    [Step 2]
    The minimum-profit floor is per item (default, eased for Slow / Dead / below-cost
    SKUs), except on the accounts configured in FLAT_MIN_PROFIT_ACCOUNTS, which use one
@@ -318,7 +318,7 @@ def fetch_offer_items(token: str, api_offers: list[dict], account: str, today: s
 
 
 # --- Enrich with SQL data ----------------------------------------------------
-# The eBay grid gives us the item and its price; the SKU's cost and aged status
+# GetItem gives us the item and its price; the SKU's cost and aged status
 # come from SQL (the same two tables the old workbook read). We pull the two
 # small reference tables once, then match them onto the offers by SKU in pandas.
 
@@ -382,7 +382,7 @@ def enrich_offers(offers: pd.DataFrame, site_costs: pd.DataFrame, aged: pd.DataF
     EnableSellingBelowCost flag is treated as False.
 
     Args:
-        offers: The scraped offers table (see :func:`offers_to_frame`).
+        offers: The listings table (see :func:`items_to_frame`).
         site_costs: [sku, site_cost, weight_oz, sell_below_cost] reference data.
         aged: [sku, aged_status] reference data.
 
@@ -572,7 +572,7 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
     """
     # Cases where we can't safely act on the offer — skip with the reason why.
     if cx_offer <= 0:
-        return ("Expired Offer", 0.0, 0.0)  # was pending at scrape time, now unreadable = expired/withdrawn
+        return ("Expired Offer", 0.0, 0.0)  # no readable amount = expired/withdrawn
     if not is_buyer_offer(offer_code):
         return ("Awaiting Buyer", 0.0, 0.0)  # our own live counteroffer; eBay rejects answering it (21940/21913)
     if out_of_stock:
@@ -612,8 +612,7 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
 # BestOfferCodeType) — including our OWN outstanding counteroffers, so the code is what
 # says whose offer it is. We page through all results because eBay caps the page size, so
 # reading only page 1 would silently drop later offers. It's a server API with no
-# browser, so eBay's bot check never fires. This replaces the old per-item browser
-# read. Good candidate to promote into seller_automation_utils. Buyer identity in
+# browser anywhere in this run. Buyer identity in
 # the response is intentionally never parsed/stored (keeps our
 # Marketplace-Account-Deletion exemption valid).
 
@@ -932,7 +931,7 @@ def respond_to_offers(results: pd.DataFrame, token: str, settings: dict, live: b
 # =============================================================================
 # RECORD — build the full result record and store it in SQL            [Step 4]
 # =============================================================================
-# Every offer becomes one archive row: the numbers we scraped, the cost we
+# Every offer becomes one archive row: the numbers we read, the cost we
 # enriched, the margins we computed, and the decision we reached. `BestOffers`
 # is a permanent history — we only ever add today's rows, never wipe past days.
 
@@ -945,10 +944,10 @@ RESULT_COLUMNS = [
 
 
 def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFrame:
-    """Attach the API's live offers to the scraped grid, one row per offer.
+    """Attach the API's live offers to the listings table, one row per offer.
 
     A single listing can carry several buyer offers; each becomes its own row so
-    every offer is decided and answered, not just one. A grid item with no live
+    every offer is decided and answered, not just one. A listing with no live
     offer keeps a single row with ``cx_offer`` 0 (it reads as an expired offer)
     and ``best_offer_id`` None. Buyer identity is never carried across.
 
@@ -957,7 +956,7 @@ def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFr
     apart (see :func:`is_buyer_offer`).
 
     Args:
-        offers: The enriched grid, one row per listing.
+        offers: The enriched listings table, one row per listing.
         api_offers: :func:`get_best_offers` output — one dict per active offer.
 
     Returns:
@@ -985,7 +984,7 @@ def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFr
     # a de-duplicated set of item ids, so a listing carrying five offers fans out to
     # five rows and no further. If a listing ever appeared twice the merge would
     # cross-product into phantom offers, which is how the 7/29 duplicate rows arose
-    # when this frame came from the scraped grid.
+    # when this frame came from the scraped grid it replaced.
     if api_offers and len(merged) != len(api_offers):
         raise RuntimeError(
             f"Offer rows changed in the merge: {len(api_offers)} offers became {len(merged)} rows. "
@@ -1099,7 +1098,7 @@ def store_account_results(conn: object, results: pd.DataFrame, account: str, tod
     """Replace one account's not-yet-answered rows for today, in a single commit.
 
     Deletes the account's un-answered rows for today first, so a rerun refreshes the
-    day's decisions with the latest scrape without duplicating; rows already answered
+    day's decisions with the latest read without duplicating; rows already answered
     (a real offer was sent) are kept as the permanent record. NaN becomes None before
     insert — ``insert_dataframe`` binds with pyodbc, which can't bind NaN to a nullable
     column, so not-applicable fields must arrive as None to land as SQL NULL.
@@ -1323,8 +1322,8 @@ def main() -> None:
     """Read the settings, then run the daily best-offer flow.
 
     Settings are read first: if the workbook has a problem, email the business
-    team and stop before any browser or database work. Then each account is
-    scraped, enriched, decided, answered on eBay, and archived to SQL, and a
+    team and stop before any API or database work. Then each account is
+    read, enriched, decided, answered on eBay, and archived to SQL, and a
     summary email is sent. Answering is gated behind ``ACT_ON_OFFERS``: with the
     flag off the run is a dry run that records decisions but sends nothing.
     """
@@ -1384,10 +1383,10 @@ def main() -> None:
             reports_conn.close()
         log.info(f"Loaded [cyan]{len(site_costs)}[/cyan] site costs and [cyan]{len(aged)}[/cyan] aged-status rows.")
 
-        # Scrape, enrich, decide, answer, and archive each account. A rerun refreshes
+        # Read, enrich, decide, answer, and archive each account. A rerun refreshes
         # each account's not-yet-answered rows and skips accounts already fully answered.
         # Accounts are independent: one that fails is cleaned up, recorded, and skipped so
-        # the rest still run — a browser flake on account 2 used to cost accounts 3 and 4
+        # the rest still run — a failure on account 2 used to cost accounts 3 and 4
         # their whole day. Offers are answered on eBay only when ACT_ON_OFFERS is set.
         ebay_conn = custom_functions.sql_connection(RESULTS_DB)
         for account in EBAY_PROFILES:
