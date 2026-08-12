@@ -14,7 +14,7 @@ COLUMNS = ["date", "account", "title", "sku", "current_price", "item_number", "o
 
 
 def item(item_number: str = "234567890123", sku: str | None = "ACM-HP-001",
-         price: float = 179.99, available: int = 4, title: str = "Acme Studio Headphones") -> dict:
+         price: float = 149.99, available: int = 4, title: str = "Acme Studio Headphones") -> dict:
     return {
         "item_number": item_number, "title": title, "sku": sku,
         "current_price": price, "quantity": available + 1, "quantity_sold": 1,
@@ -36,7 +36,7 @@ def test_columns_are_shaped_and_ordered():
     assert row["date"] == "2026-07-02"
     assert row["account"] == "Acct1"
     assert row["item_number"] == "234567890123"
-    assert row["current_price"] == 179.99
+    assert row["current_price"] == 149.99
 
 
 def test_no_items_gives_an_empty_frame_that_still_has_the_columns():
