@@ -40,19 +40,14 @@ from pathlib import Path
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
-from seller_automation_utils import accounts, alert_utils, chrome, custom_functions, database_utils, ebay, excel_utils
+from seller_automation_utils import alert_utils, custom_functions, database_utils, ebay_api, excel_utils
 from seller_automation_utils.accounts import EBAY_PROFILES
 from seller_automation_utils.config_utils import get_env, load_config_safe
 from seller_automation_utils.greeting import greeting_for
 from seller_automation_utils.logging_utils import setup_logging
 from seller_automation_utils.outlook import send_email
 from seller_automation_utils.schedule_utils import run_on_schedule
-from seller_automation_utils.screenshot_utils import save_debug_screenshot
 from seller_automation_utils.ui_utils import ask_user
 
 log = setup_logging("ebay_best_offers")
@@ -249,117 +244,77 @@ def _split_emails(raw: str | None) -> list[str]:
 
 
 # =============================================================================
-# SCRAPE — read each account's pending offers from the Seller Hub grid  [Step 3]
+# LISTINGS — read each offered item's details from the Trading API    [Step 3]
 # =============================================================================
-# eBay renders the offers as a data grid. We read each value from its own cell
-# in one JavaScript call, so the badges and links eBay injects between cells are
-# never mistaken for data. Every real offer row is `<tr class="grid-row"
-# data-id="{item number}">`, so the item number comes straight off the row.
+# The Seller Hub grid used to supply the item, its SKU, its price and whether it
+# was out of stock. eBay's Customize-table dialog stopped saving in Aug 2026 and
+# took that path down, so the same fields now come from GetItem — no browser, so
+# no bot check and no grid layout to track. Only the items that actually carry an
+# offer are read, which is a few dozen per account rather than the whole account.
 
-PENDING_OFFERS_URL = (
-    "https://www.ebay.com/sh/lst/active"
-    "?action=search&format=ALL_FORMATS&status=PENDING_OFFERS&offset=0&limit=200"
-)
+def items_to_frame(items: list[dict], account: str, today: str) -> pd.DataFrame:
+    """Shape listing details into the offers table, one row per listing.
 
-# One value per column, read from the grid cell it belongs to. `.clipped` spans
-# are screen-reader text inside the cells — removed on a clone so the live page
-# is untouched. An out-of-stock listing has no "Respond" link, so an empty href
-# flags it. The order here must match the columns in `offers_to_frame`.
-EXTRACT_OFFERS_JS = """
-const strip = (el) => {
-    if (!el) return "";
-    const c = el.cloneNode(true);
-    c.querySelectorAll(".clipped").forEach(n => n.remove());
-    return c.textContent.trim();
-};
-return Array.from(document.querySelectorAll("tr.grid-row[data-id]")).map(r => [
-    r.dataset.id,
-    strip(r.querySelector(".shui-dt-column__title .column-title__text")),
-    strip(r.querySelector(".shui-dt-column__listingSKU .shui-dt--text-column")),
-    strip(r.querySelector(".shui-dt-column__price .col-price__current")),
-    (r.querySelector(".shui-dt-column__lineActions a.primary-action__button") || {}).href || "",
-]);
-"""
+    Pure (no HTTP) so it is easy to test.
 
-# eBay's own "no results" element. It is rendered only when the filter matched
-# nothing, and is absent (not hidden) whenever the grid has rows, which is what
-# lets an empty account be told apart from a broken row selector.
-ZERO_RESULTS_SELECTOR = ".zeroResultsMessage"
-
-
-def offers_to_frame(rows: list, account: str, today: str) -> pd.DataFrame:
-    """Shape the raw grid rows into the offers table.
-
-    Pure (no browser) so it is easy to test. Columns are ordered date, account,
-    then the offer fields. An empty respond link means the listing is out of
-    stock (no way to respond), flagged in ``out_of_stock``.
+    ``out_of_stock`` is derived from the available quantity. The Seller Hub grid
+    used to give this directly — eBay omitted the respond link when an offer
+    could not be answered — so this is a re-derivation of that signal, not the
+    same one. Measured 2026-08-11 against every listing then carrying an offer:
+    1 of 57 out of stock, against 0-7% (avg ~2.6%) recorded by the archive over
+    the preceding fortnight.
 
     Args:
-        rows: ``[item_number, title, sku, current_price, respond_href]`` per offer.
+        items: `ebay_api.get_item` results, one per listing.
         account: eBay account display name.
         today: Report date string (YYYY-MM-DD).
 
     Returns:
         DataFrame with columns date, account, title, sku, current_price,
-        item_number, out_of_stock (current_price as a number).
+        item_number, out_of_stock.
     """
-    df = pd.DataFrame(rows, columns=["item_number", "title", "sku", "current_price", "respond_href"])
-    df["out_of_stock"] = df["respond_href"] == ""
-    df["current_price"] = pd.to_numeric(
-        df["current_price"].astype(str).str.replace(r"[$,]", "", regex=True), errors="coerce"
-    )
-    df.insert(0, "account", account)
-    df.insert(0, "date", today)
-    return df[["date", "account", "title", "sku", "current_price", "item_number", "out_of_stock"]]
+    columns = ["date", "account", "title", "sku", "current_price", "item_number", "out_of_stock"]
+    frame = pd.DataFrame([
+        {
+            "date": today,
+            "account": account,
+            "title": item.get("title"),
+            "sku": item.get("sku"),
+            "current_price": item.get("current_price"),
+            "item_number": item.get("item_number"),
+            "out_of_stock": item.get("quantity_available", 0) <= 0,
+        }
+        for item in items
+    ], columns=columns)
+    frame["current_price"] = pd.to_numeric(frame["current_price"], errors="coerce")
+    return frame
 
 
-def scrape_pending_offers(driver: object, account: str, today: str) -> pd.DataFrame:
-    """Open one account's pending offers, reset the columns, and read the grid.
+def fetch_offer_items(token: str, api_offers: list[dict], account: str, today: str) -> pd.DataFrame:
+    """Fetch listing details for every item that currently carries an offer.
 
-    Calls the shared ``customize_offers_table`` first so the table is reset to a
-    known layout (the core Title/SKU/Price columns are always in that set), then
-    re-applies the pending-offers view and reads every row in one JS call.
+    Driven by the offers rather than by a listing sweep: only a few dozen items
+    matter per account per day, so one `GetItem` each is far cheaper than pulling
+    the whole account. The item ids are de-duplicated first, which is what keeps
+    one listing carrying several offers from fanning out twice later.
 
     Args:
-        driver: Active browser already logged into the account.
+        token: The seller account's Trading API user token.
+        api_offers: :func:`get_best_offers` output.
         account: eBay account display name.
         today: Report date string (YYYY-MM-DD).
 
     Returns:
-        The account's offers as a DataFrame (see :func:`offers_to_frame`); empty
-        if the account has no pending offers, which eBay reports with a
-        zero-results message rather than by omitting the table.
-
-    Raises:
-        RuntimeError: If the grid renders with neither offer rows nor a
-            zero-results message, meaning the row selector no longer matches.
+        One row per distinct listing, shaped by :func:`items_to_frame`.
     """
-    driver.get(PENDING_OFFERS_URL)
-    driver.switch_to_window(0)
-    ebay.customize_offers_table(driver)  # reset columns; shared accounts drift
-
-    driver.get(PENDING_OFFERS_URL)  # re-apply the pending-offers view after the reload
-    driver.switch_to_window(0)
-    try:
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".shui-dt")))
-    except TimeoutException:
+    item_ids = sorted({o["item_number"] for o in api_offers if o.get("item_number")})
+    if not item_ids:
         log.info(f"No pending offers for [cyan]{account}[/cyan].")
-        return offers_to_frame([], account, today)
+        return items_to_frame([], account, today)
 
-    rows = driver.execute_script(EXTRACT_OFFERS_JS)
-    if not rows:
-        # eBay renders the table shell (headers and summary bar) even when nothing
-        # matches, so an account with no offers lands here instead of the timeout
-        # above. Trust eBay's own zero-results element over an empty row list: no
-        # element means the rows really are missing and the run should fail loudly.
-        if driver.find_elements(By.CSS_SELECTOR, ZERO_RESULTS_SELECTOR):
-            log.info(f"No pending offers for [cyan]{account}[/cyan].")
-            return offers_to_frame([], account, today)
-        save_debug_screenshot(driver, root=account, section="scrape", description="no_offer_rows")
-        raise RuntimeError("Pending-offers grid rendered but no rows were read — the eBay layout may have changed.")
-
-    log.info(f"Read [cyan]{len(rows)}[/cyan] pending offers for [cyan]{account}[/cyan].")
-    return offers_to_frame(rows, account, today)
+    log.info(f"Reading {len(item_ids)} listing(s) with offers for [cyan]{account}[/cyan].")
+    items = [ebay_api.get_item(token, item_id) for item_id in item_ids]
+    return items_to_frame(items, account, today)
 
 
 # --- Enrich with SQL data ----------------------------------------------------
@@ -1025,6 +980,17 @@ def attach_api_offers(offers: pd.DataFrame, api_offers: list[dict]) -> pd.DataFr
         api_df = pd.DataFrame(columns=cols)
 
     merged = offers.merge(api_df, on="item_number", how="left")
+
+    # Every offer must survive as exactly one row. The listings frame is built from
+    # a de-duplicated set of item ids, so a listing carrying five offers fans out to
+    # five rows and no further. If a listing ever appeared twice the merge would
+    # cross-product into phantom offers, which is how the 7/29 duplicate rows arose
+    # when this frame came from the scraped grid.
+    if api_offers and len(merged) != len(api_offers):
+        raise RuntimeError(
+            f"Offer rows changed in the merge: {len(api_offers)} offers became {len(merged)} rows. "
+            "A listing is probably duplicated in the listings frame."
+        )
     merged["cx_offer"] = pd.to_numeric(merged["cx_offer"], errors="coerce").fillna(0.0)
     merged["offer_quantity"] = pd.to_numeric(merged["offer_quantity"], errors="coerce").fillna(1).astype(int)
     merged["best_offer_id"] = merged["best_offer_id"].where(merged["best_offer_id"].notna(), None)  # NaN -> None for no-offer rows
@@ -1389,8 +1355,6 @@ def main() -> None:
     )
 
     today = date.today().strftime("%Y-%m-%d")
-    user_data_dir = get_env("CHROME_USER_DATA_DIR", required=True)
-    password = get_env("eBay_pass", required=True)
 
     # Safety gate: only answer offers on eBay when explicitly enabled. Off => dry run.
     act_live = (get_env("ACT_ON_OFFERS") or "").strip().lower() in ("1", "true", "yes", "on")
@@ -1426,28 +1390,14 @@ def main() -> None:
         # the rest still run — a browser flake on account 2 used to cost accounts 3 and 4
         # their whole day. Offers are answered on eBay only when ACT_ON_OFFERS is set.
         ebay_conn = custom_functions.sql_connection(RESULTS_DB)
-        for account, profile in EBAY_PROFILES.items():
+        for account in EBAY_PROFILES:
             if account_fully_acted(ebay_conn, account, today):
                 log.info(f"[cyan]{account}[/cyan] already recorded and answered today — skipping.")
                 continue
 
-            driver = None
             try:
-                driver = chrome.start_browser(user_data_dir, profile, headless=True)
-                driver.get("https://www.ebay.com/sh/ovw")
-                driver.switch_to_window(0)
-                try:
-                    accounts.ebay(password=password, driver=driver)
-                except TimeoutException:
-                    pass
-
-                offers = scrape_pending_offers(driver, account, today)
-                offers = enrich_offers(offers, site_costs, aged)
-
-                # Read every buyer offer from the Trading API (all pages) — no browser,
-                # so eBay's bot check never fires. A listing can have several offers, so
-                # attach_api_offers expands to one row per offer. A grid item with no
-                # active offer becomes one row with cx_offer 0 -> Expired Offer.
+                # Offers first: they name the items worth reading. A listing can carry
+                # several offers, so attach_api_offers expands to one row per offer.
                 token = get_env(_token_env(account), required=True)
                 api_offers = get_best_offers(token)
 
@@ -1460,6 +1410,8 @@ def main() -> None:
                 if not_ours_to_answer:
                     log.info(f"Skipping offers that aren't the buyer's: {', '.join(not_ours_to_answer)}.")
 
+                offers = fetch_offer_items(token, api_offers, account, today)
+                offers = enrich_offers(offers, site_costs, aged)
                 offers = attach_api_offers(offers, api_offers)
 
                 results = build_results(offers, settings)
@@ -1491,23 +1443,11 @@ def main() -> None:
                 log.error(f"Failed on [cyan]{account}[/cyan] — skipping it and continuing with the rest.")
                 ebay_conn.rollback()
 
-                # Capture the page instead of calling handle_crash here: handle_crash ends by
-                # killing Excel and Chrome, which is right as terminal cleanup but would take
-                # out any workbook the user has open mid-run. One alert goes out at the end.
-                shot = ""
-                if driver is not None:
-                    try:
-                        shot = save_debug_screenshot(driver, root=account, section="main",
-                                                     description="account_failed")
-                    except Exception:
-                        log.warning(f"Could not capture the failure screenshot for [cyan]{account}[/cyan].")
-                failed[account] = f"Screenshot: {shot or 'not captured'}\n\n{tb}"
-            finally:
-                if driver is not None:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
+                # No screenshot to take any more: there is no browser. The traceback
+                # carries eBay's own error text, which is what a failure here now is.
+                # One alert goes out at the end rather than calling handle_crash per
+                # account, since that ends by killing Excel and Chrome.
+                failed[account] = tb
     except Exception:
         alert_utils.handle_crash(None, traceback.format_exc(), automation_name="eBay Best Offers")
         raise SystemExit(1)

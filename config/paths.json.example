@@ -1,5 +1,4 @@
 {
-    "download_path": "downloaded_files",
     "offers_wb_path": "C:/path/to/your/onedrive/eBay/Pending-Offers.xlsm",
     "aged_inv_path": "C:/path/to/your/onedrive/eBay/Items/eBay Aged Inventory",
     "control_wb_path": "C:/path/to/your/onedrive/eBay/Reports/Best-Offers-Settings.xlsx",

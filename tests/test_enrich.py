@@ -11,7 +11,15 @@ import run_ebay_best_offers as script
 
 
 def _offers(rows):
-    return script.offers_to_frame(rows, "Acct", "2026-07-02")
+    """Build the listings frame from ``[item_number, title, sku, price]`` rows."""
+    items = [
+        {"item_number": r[0], "title": r[1], "sku": r[2],
+         "current_price": float(str(r[3]).replace("$", "").replace(",", "")),
+         "quantity": 5, "quantity_sold": 1, "quantity_available": 4,
+         "listing_status": "Active"}
+        for r in rows
+    ]
+    return script.items_to_frame(items, "Acct", "2026-07-02")
 
 
 def test_enrich_matches_by_sku_and_fills_missing():

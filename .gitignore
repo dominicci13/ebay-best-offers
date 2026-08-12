@@ -10,8 +10,9 @@ logs/*
 !logs/.gitkeep
 output/*
 !output/.gitkeep
-downloaded_files/*
-!downloaded_files/.gitkeep
+# SeleniumBase deletes this folder on every startup, so a tracked
+# placeholder cannot survive. Nothing reads it.
+downloaded_files/
 
 # Screenshots — ignore everything except .gitkeep so the folder is tracked
 screenshots/*

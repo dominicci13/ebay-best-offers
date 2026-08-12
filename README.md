@@ -2,8 +2,8 @@
 
 Daily automation that reviews every pending eBay Best Offer across a fleet of
 seller accounts and records a priced decision for each one. It reads the pricing
-rules from a staff-editable control workbook, scrapes each account's pending
-offers from Seller Hub, enriches every SKU with its cost and aged status from SQL
+rules from a staff-editable control workbook, reads each account's pending
+offers from the eBay API, enriches every SKU with its cost and aged status from SQL
 Server, reads the buyer's offer, decides Accept / Counteroffer / Decline against a
 profit-margin rule, answers each offer on eBay through the Trading API, and writes
 the full result to a permanent SQL archive. It then refreshes a read-only report
@@ -27,12 +27,15 @@ append-only archive** that never loses a day.
    floors, counteroffer discount band). If a value is missing or out of
    range, the run stops and emails the business team exactly what to fix, so no
    offer is ever priced on a bad number.
-2. **Scrape pending offers** for each seller account from Seller Hub.
-3. **Enrich from SQL** — match each SKU to its site cost and aged status.
-4. **Read every buyer offer** from the eBay Trading API (`GetBestOffers`, paging
-   through all results) per account — no browser, so eBay's bot check can't fire.
-   Offers are matched onto the scraped rows by item number, one row per offer, so a
-   listing with several offers has all of them handled.
+2. **Read every buyer offer** from the eBay Trading API (`GetBestOffers`, paging
+   through all results) per account.
+3. **Read the offered listings** — one `GetItem` per distinct item the offers name,
+   giving SKU, price and available quantity. Only listings that carry an offer are
+   read, so this is a few dozen calls rather than a whole-account sweep.
+4. **Enrich from SQL** — match each SKU to its site cost and aged status. Offers are
+   then matched onto the listings by item number, **one row per offer**, so a listing
+   with several offers has all of them handled; the merge asserts that the row count
+   still equals the offer count, so an offer can never be dropped or duplicated.
 5. **Decide** per offer: Accept, Counteroffer, or Decline, or a skip reason
    (Expired Offer, Awaiting Buyer, Out of Stock, Missing Site Cost).
 6. **Answer** each offer on eBay (`RespondToBestOffer`) — Accept, send the
@@ -54,10 +57,9 @@ flowchart LR
 
     subgraph loop[Per account]
         direction TB
-        login[Login] --> scrape[Scrape grid<br/>item / SKU / price]
-        scrape --> enrich[Enrich from SQL<br/>site cost + aged status]
-        enrich --> read[Read offers<br/>Trading API GetBestOffers]
-        read --> decide[decide_offer]
+        read[Read offers<br/>GetBestOffers] --> items[Read listings<br/>GetItem per offered item]
+        items --> enrich[Enrich from SQL<br/>site cost + aged status]
+        enrich --> decide[decide_offer]
         decide --> respond[Answer offer<br/>RespondToBestOffer<br/>gated by ACT_ON_OFFERS]
         respond --> store[(eBay.dbo.BestOffers<br/>permanent archive)]
     end
@@ -123,10 +125,10 @@ The est_shipping weight tiers are a pricing table in code (`SHIPPING_TIERS`).
 `eBay.dbo.BestOffers` is **append-only and never truncated** — every past day is
 kept. The report shows only today (its Power Query filters on `report_date`).
 Same-day reruns are idempotent per account: an account's not-yet-answered rows are
-replaced with the latest scrape, and an account whose offers were all answered is
+replaced with the latest read, and an account whose offers were all answered is
 skipped. Accounts are independent: one that fails is skipped and the rest still run.
 Its rows are cleared only if the failure hit the insert itself, so a failure earlier
-in the account (browser, API) leaves an earlier run's rows intact. Failed accounts
+in the account leaves an earlier run's rows intact. Failed accounts
 are named in a banner on the summary email and in one crash report sent at the end;
 the run exits non-zero only if no account was recorded at all.
 
@@ -213,17 +215,19 @@ until the next **17:30 daily** trigger.
 ### Tests
 
 ```powershell
-$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD=1; .venv\Scripts\python -m pytest -q
+.venv\Scripts\python -m pytest -q
 ```
 
-(The env var sidesteps a seleniumbase pytest-plugin import that needs setuptools.)
+The plugin-autoload workaround is no longer needed: `pytest-html` was upgraded to
+4.x. seleniumbase pins 2.0.1, which imports `pkg_resources` — removed in setuptools
+82 — and that stopped pytest starting at all. **Upgrading the shared library pulls
+seleniumbase and drags 2.0.1 back**, so re-run `pip install -U pytest-html` after
+any `pip install -U seller-automation-utils`.
 
 ## Environment variables
 
 | Variable | Description |
 |---|---|
-| `CHROME_USER_DATA_DIR` | Path to the dedicated Chrome automation profile directory |
-| `eBay_pass` | eBay account password (browser grid scrape / login) |
 | `EBAY_APP_ID` / `EBAY_DEV_ID` / `EBAY_CERT_ID` | eBay Trading API app keyset (one app covers all accounts) |
 | `EBAY_AUTH_TOKEN_<ACCOUNT>` | Trading API user token per seller account (e.g. `EBAY_AUTH_TOKEN_ACCOUNT1`) |
 | `ACT_ON_OFFERS` | Safety gate. `false`/unset = dry run (decide + record, send nothing). `true` = answer offers on eBay for real |
