@@ -67,8 +67,9 @@ CONFIG_DIR = Path(__file__).resolve().parent / "config"
 SETTINGS_SHEET = "Settings"
 
 # workbook label -> (name used in code, lowest ok, highest ok, kind). Percentage
-# bounds are fractions (0.30 = 30%); "minimum estimated shipping" is a dollar
-# amount. The "expected" hint in error messages is derived from the bounds, so no
+# bounds are fractions (0.30 = 30%). The "usd" kind is still handled by
+# check_settings but no setting uses it today; shipping is a weight tier in code.
+# The "expected" hint in error messages is derived from the bounds, so no
 # workbook value is ever hardcoded here.
 SETTINGS = {
     "ebay commission":                       ("commission",                 0.01, 0.30, "pct"),
@@ -78,7 +79,6 @@ SETTINGS = {
     "sell below cost minimum profit margin": ("sell_below_cost_min_profit", 0.00, 0.50, "pct"),
     "min counteroffer discount":             ("min_discount",               0.00, 0.50, "pct"),
     "max counteroffer discount":             ("max_discount",               0.00, 0.50, "pct"),
-    "minimum estimated shipping":            ("shipping_floor",             0.00, 100.0, "usd"),
 }
 
 # Accounts priced to one flat floor instead of the aged tiers: {account: workbook label}.
@@ -160,8 +160,7 @@ def check_settings(entered: dict) -> tuple[dict, list[str]]:
 
     Returns:
         ``(settings, problems)``:
-          settings - the tunables by name (profit / discount floors as fractions,
-                     ``shipping_floor`` in dollars).
+          settings - the tunables by name (profit / discount floors as fractions).
           problems - plain-language issues; an empty list means everything is fine.
     """
     settings = {}

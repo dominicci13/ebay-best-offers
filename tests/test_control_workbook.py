@@ -21,7 +21,6 @@ def _good(**overrides):
         "accountflat minimum profit margin": 0.02,
         "min counteroffer discount": 0.05,
         "max counteroffer discount": 0.10,
-        "minimum estimated shipping": 12,
     }
     entered.update(overrides)
     return entered
@@ -39,7 +38,6 @@ def test_valid_settings_have_no_problems():
         "flat_min_profit::AccountFlat": 0.02,
         "min_discount": 0.05,
         "max_discount": 0.10,
-        "shipping_floor": 12.0,
     }
 
 
@@ -54,7 +52,6 @@ def test_valid_settings_have_no_problems():
         "accountflat minimum profit margin",
         "min counteroffer discount",
         "max counteroffer discount",
-        "minimum estimated shipping",
     ],
 )
 def test_missing_label_is_reported(missing):
@@ -78,17 +75,6 @@ def test_percent_out_of_range_uses_percent_hint():
     # 12 (== 1200%) is the classic "typed 12 instead of 12%" slip.
     _, problems = script.check_settings(_good(**{"ebay commission": 12}))
     assert any("commission" in p.lower() and "percentage" in p.lower() for p in problems)
-
-
-def test_shipping_floor_out_of_range_uses_dollar_hint():
-    _, problems = script.check_settings(_good(**{"minimum estimated shipping": 200}))
-    assert any("shipping" in p.lower() and "dollar" in p.lower() for p in problems)
-
-
-def test_shipping_floor_accepts_dollar_string():
-    settings, problems = script.check_settings(_good(**{"minimum estimated shipping": "$12"}))
-    assert problems == []
-    assert settings["shipping_floor"] == 12.0
 
 
 def test_inverted_discount_band_is_reported():

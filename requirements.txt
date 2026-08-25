@@ -6,7 +6,6 @@ seller-automation-utils @ git+https://github.com/dominicci13/shared-python-utils
 pandas
 python-dotenv
 requests
-selenium
 xlwings
 
 # pandas Excel-reader engine for pd.read_excel(...)

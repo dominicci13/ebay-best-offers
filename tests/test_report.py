@@ -15,7 +15,6 @@ SETTINGS = {
     "flat_min_profit::AccountFlat": 0.02,
     "min_discount": 0.05,
     "max_discount": 0.10,
-    "shipping_floor": 12.0,
 }
 
 # A counter, an accept, a decline; one account name carries an ampersand (must escape).

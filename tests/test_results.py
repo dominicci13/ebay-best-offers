@@ -19,7 +19,6 @@ SETTINGS = {
     "flat_min_profit::AccountFlat": 0.02,
     "min_discount": 0.05,
     "max_discount": 0.10,
-    "shipping_floor": 12.0,
 }
 
 # One row per outcome. Columns match an enriched offer with the API offer attached.
