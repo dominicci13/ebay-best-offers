@@ -10,6 +10,9 @@ Runs once a day at 17:30 local time. Each run:
    pages), reads each offered listing with GetItem (SKU, price, stock), and
    enriches from SQL (site cost, weight, aged status).              [Step 3]
 3. Decides Accept / Counteroffer / Decline (or skips) per offer.    [Step 2]
+   Accounts in DISCOUNT_CAP_ACCOUNTS are priced differently: accept anything within
+   their maximum discount off the selling price, otherwise counter at exactly that
+   discount, with the profit floor still applying underneath as a backstop.
    The minimum-profit floor is per item (default, eased for Slow / Dead / below-cost
    SKUs), except on the accounts configured in FLAT_MIN_PROFIT_ACCOUNTS, which use one
    flat floor for every item regardless of age. Our own outstanding counteroffers come
@@ -31,6 +34,7 @@ Import-safe: the prompt and the scheduler run only under
 from __future__ import annotations
 
 import html
+import math
 import re
 import traceback
 import xml.etree.ElementTree as ET
@@ -87,11 +91,43 @@ SETTINGS = {
 #   "flat_min_profit_accounts": {"<account>": "<settings workbook label>"}
 # Each configured label becomes a required workbook value, so a missing cell stops the
 # run exactly like any other setting rather than silently pricing at the default floor.
-FLAT_MIN_PROFIT_ACCOUNTS: dict[str, str] = {
-    account: str(label).strip().lower()
-    for account, label in load_config_safe(
-        CONFIG_DIR / "accounts.json").get("flat_min_profit_accounts", {}).items()
-}
+_ACCOUNTS_CFG = load_config_safe(CONFIG_DIR / "accounts.json")
+
+
+def _accounts_by_label(configured: dict) -> dict[str, str]:
+    """Config ``{account: workbook label}`` re-keyed on the profile name the run uses.
+
+    The run loops over :data:`EBAY_PROFILES`, so a pricing rule only fires when its
+    config key matches a profile name exactly. Config is hand-edited, so matching is
+    done loosely (stripped, case-insensitive) and the profile's own spelling is stored,
+    which keeps the membership tests in the pricing path exact. An account matching no
+    profile is dropped with a warning rather than kept: a rule that can never fire must
+    not be reported to the business as applied.
+    """
+    by_profile = {str(profile).strip().lower(): str(profile) for profile in EBAY_PROFILES}
+    resolved = {}
+    for account, label in configured.items():
+        profile = by_profile.get(str(account).strip().lower())
+        if profile is None:
+            log.warning(f"accounts.json names '{account}', which is not a configured eBay profile — "
+                        "its pricing rule is ignored.")
+            continue
+        resolved[profile] = str(label).strip().lower()
+    return resolved
+
+
+FLAT_MIN_PROFIT_ACCOUNTS: dict[str, str] = _accounts_by_label(
+    _ACCOUNTS_CFG.get("flat_min_profit_accounts", {})
+)
+
+# Accounts priced off the selling price instead of by margin: {account: workbook label}.
+# The label's value is the biggest discount we will give. Kept separate from
+# FLAT_MIN_PROFIT_ACCOUNTS (rather than overloading it) so an account can use either rule,
+# both, or neither. Same gitignored-config reasoning as above. Shape in config/accounts.json:
+#   "discount_cap_accounts": {"<account>": "<settings workbook label>"}
+DISCOUNT_CAP_ACCOUNTS: dict[str, str] = _accounts_by_label(
+    _ACCOUNTS_CFG.get("discount_cap_accounts", {})
+)
 
 
 def flat_floor_key(account: str) -> str:
@@ -99,12 +135,33 @@ def flat_floor_key(account: str) -> str:
     return f"flat_min_profit::{account}"
 
 
-def settings_spec() -> dict:
-    """:data:`SETTINGS` plus one required floor per flat-floor account."""
+def discount_cap_key(account: str) -> str:
+    """The settings key holding one account's maximum allowed discount."""
+    return f"discount_cap::{account}"
+
+
+def settings_spec() -> tuple[dict, list[str]]:
+    """:data:`SETTINGS` plus one required floor per flat-floor account and one
+    required discount cap per discount-cap account.
+
+    Returns:
+        ``(spec, problems)``. Two accounts pointing at the same workbook label (a
+        copy-paste slip in ``accounts.json``) would otherwise overwrite each other
+        here, leaving the loser's setting absent and raising a ``KeyError`` on the
+        first offer — long after the settings check that exists to catch exactly
+        this. The collision is reported as a settings problem instead.
+    """
     spec = dict(SETTINGS)
-    for account, label in FLAT_MIN_PROFIT_ACCOUNTS.items():
-        spec[label] = (flat_floor_key(account), 0.00, 0.50, "pct")
-    return spec
+    problems = []
+    pairs = ([(flat_floor_key(a), label) for a, label in FLAT_MIN_PROFIT_ACCOUNTS.items()]
+             + [(discount_cap_key(a), label) for a, label in DISCOUNT_CAP_ACCOUNTS.items()])
+    for name, label in pairs:
+        if label in spec:
+            problems.append(f"'{label}' is used by more than one setting — give each account "
+                            "its own row label in the settings file and in accounts.json.")
+            continue
+        spec[label] = (name, 0.00, 0.50, "pct")
+    return spec, problems
 
 
 def flat_floor_summary(settings: dict, separator: str = ", ") -> str:
@@ -117,6 +174,20 @@ def flat_floor_summary(settings: dict, separator: str = ", ") -> str:
         f"{account} {settings[flat_floor_key(account)]:.1%} on every item"
         for account in FLAT_MIN_PROFIT_ACCOUNTS
         if flat_floor_key(account) in settings
+    ]
+    return f"{separator}{'; '.join(parts)}" if parts else ""
+
+
+def discount_cap_summary(settings: dict, separator: str = ", ") -> str:
+    """Name each discount-cap account and its cap, for the log and the email footer.
+
+    Empty when no account is configured, so the surrounding sentence still reads
+    correctly on a fleet with no discount-cap account.
+    """
+    parts = [
+        f"{account} priced to {settings[discount_cap_key(account)]:.1%} off the selling price"
+        for account in DISCOUNT_CAP_ACCOUNTS
+        if discount_cap_key(account) in settings
     ]
     return f"{separator}{'; '.join(parts)}" if parts else ""
 
@@ -164,9 +235,9 @@ def check_settings(entered: dict) -> tuple[dict, list[str]]:
           problems - plain-language issues; an empty list means everything is fine.
     """
     settings = {}
-    problems = []
+    spec, problems = settings_spec()
 
-    for label, (name, low, high, kind) in settings_spec().items():
+    for label, (name, low, high, kind) in spec.items():
         if kind == "usd":
             expected = f"a dollar amount between ${low:,.0f} and ${high:,.0f}"
         else:
@@ -444,12 +515,15 @@ def upload_aged_inventory(aged_inv_path: str, today: str) -> None:
 
 
 # =============================================================================
-# DECIDE — profit-margin decision                                     [Step 2]
+# DECIDE — profit-margin decision, or discount cap on the accounts configured for it
+#                                                                     [Step 2]
 # =============================================================================
 # Pure functions from the offer numbers to an action — no browser, no database,
 # so every branch is easy to test. Counter with the biggest discount in the
 # allowed band that still clears the minimum profit (aged / EnableSellingBelowCost items
-# ease that floor) — the best price for the buyer that still protects us.
+# ease that floor) — the best price for the buyer that still protects us. An account in
+# DISCOUNT_CAP_ACCOUNTS ignores that band entirely and is priced by
+# decide_by_discount_cap, with the minimum profit kept only as a backstop.
 
 # Weight-based shipping tiers, keyed on total weight in ounces (WeightLbs * 16 +
 # WeightOz). Each entry is (upper bound inclusive, cost). Gaps between the stated
@@ -491,6 +565,19 @@ def margin(price: float, total_cost: float, commission: float) -> float:
     formula lives in one place.
     """
     return (price - total_cost - price * commission) / price
+
+
+def round_up_to_cent(price: float) -> float:
+    """Round a price up to the next whole cent.
+
+    Used where a price is built off break-even and should not land *under* it:
+    :func:`round` rounds to nearest, so a half-cent of rounding can cross the profit
+    floor. Pre-rounding to 4 places keeps binary-float noise (95.35000000000001) from
+    pushing a price a whole cent higher than it should go; that pre-round can itself
+    round down, so the result can sit a sub-cent fraction below break-even. Deliberate
+    trade: risking ~1e-5 under beats charging a whole cent over on float noise.
+    """
+    return math.ceil(round(price, 4) * 100) / 100
 
 
 def effective_min_profit(aged_status: str, sell_below_cost: bool, settings: dict,
@@ -540,6 +627,56 @@ def is_buyer_offer(offer_code: str | None) -> bool:
     return str(offer_code).startswith(BUYER_CODE_PREFIX)
 
 
+def decide_by_discount_cap(cx_offer: float, current_price: float, total_cost: float,
+                           commission: float, min_profit: float,
+                           max_discount: float) -> tuple[str, float, float]:
+    """Decide one offer by discount off the selling price, margin floor as a backstop.
+
+    The rule is "accept anything within X% of the selling price, otherwise counter at
+    exactly X% off". The profit floor still applies underneath it, so an offer inside the
+    cap that would sell at a loss is countered rather than accepted, and an item that
+    cannot clear the floor at any price is declined. The workbook's min/max counteroffer
+    discount band is deliberately NOT consulted: the counter here is the cap itself, not
+    the deepest discount in a band that still clears the margin.
+
+    The counter is rounded UP to the cent, so rounding cannot take it a cent below
+    break-even; the margin-first path in :func:`decide_offer` still rounds to nearest.
+    The asymmetry is deliberate: rounding up there too would move live counter prices
+    on the accounts that never asked for this rule.
+
+    Args:
+        cx_offer: The buyer's offer amount.
+        current_price: Our current list price. This is ``SellingStatus/CurrentPrice``
+            from GetItem, which is the Buy It Now price on a fixed-price listing but
+            the current BID on an auction-format one — every price this account gets
+            is a multiple of it, so re-check if the listing mix ever changes.
+        total_cost: Site cost plus estimated shipping.
+        commission: eBay's cut, as a fraction.
+        min_profit: The lowest margin we will accept, from :func:`effective_min_profit`.
+        max_discount: The biggest discount this account may give, as a fraction.
+
+    Returns:
+        ``(action, counter_price, profit_pct)`` — the same shape as :func:`decide_offer`.
+    """
+    cap_price = round(current_price * (1 - max_discount), 2)
+
+    # Within the cap AND profitable — accept. The margin check is the backstop that keeps
+    # a near-cost item from auto-selling at a loss just because the offer looked close enough.
+    if cx_offer >= cap_price and margin(cx_offer, total_cost, commission) >= min_profit:
+        return ("Accepted", 0.0, round(margin(cx_offer, total_cost, commission), 4))
+
+    break_even = total_cost / (1 - commission - min_profit)  # price where margin == min_profit
+    counter = round_up_to_cent(max(cap_price, break_even))
+    if counter < current_price:
+        return ("Counteroffer", counter, round(margin(counter, total_cost, commission), 4))
+
+    # Nothing left to counter with: either the floor is unreachable below list, or the cap
+    # is so small that "X% off" lands on the list price — and eBay rejects a counteroffer
+    # that is not strictly below the Buy It Now price, so sending one would record a
+    # response that never happened.
+    return ("Declined", 0.0, 0.0)
+
+
 def decide_offer(cx_offer: float, current_price: float, site_cost: float,
                  weight_oz: float, aged_status: str, sell_below_cost: bool, settings: dict,
                  out_of_stock: bool = False, account: str = "",
@@ -556,8 +693,10 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
         settings: The control-workbook settings.
         out_of_stock: The listing has no sellable quantity — eBay blocks Accept and
             Counter on it, so we skip it rather than send a doomed response.
-        account: The seller account, so one in :data:`FLAT_MIN_PROFIT_ACCOUNTS` uses its
-            flat floor instead of the aged tiers.
+        account: The seller account. One in :data:`FLAT_MIN_PROFIT_ACCOUNTS` uses its
+            flat floor instead of the aged tiers; one in :data:`DISCOUNT_CAP_ACCOUNTS` is
+            priced off the selling price by :func:`decide_by_discount_cap` instead of
+            margin-first.
         offer_code: eBay's ``BestOfferCodeType`` for this offer. Anything that isn't a
             buyer code is our own outstanding counteroffer, which we must not answer.
             Empty means the read carried no code — answer it normally.
@@ -583,6 +722,10 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
     min_profit = effective_min_profit(aged_status, sell_below_cost, settings, account)
     total_cost = site_cost + est_shipping(weight_oz)
 
+    if account in DISCOUNT_CAP_ACCOUNTS:
+        return decide_by_discount_cap(cx_offer, current_price, total_cost, commission,
+                                      min_profit, settings[discount_cap_key(account)])
+
     # The buyer's own offer already clears the margin — accept it.
     if margin(cx_offer, total_cost, commission) >= min_profit:
         return ("Accepted", 0.0, round(margin(cx_offer, total_cost, commission), 4))
@@ -598,7 +741,11 @@ def decide_offer(cx_offer: float, current_price: float, site_cost: float,
     target = max(lowest_price, break_even)  # cheapest price that still clears the margin
     if target <= highest_price:
         counter = round(target, 2)
-        return ("Counteroffer", counter, round(margin(counter, total_cost, commission), 4))
+        # eBay rejects a counter that isn't below the Buy It Now price, and build_results
+        # would still have recorded it as a real Counteroffer — a phantom row in the report.
+        # Reachable when min_discount is 0%, or when rounding lands target on the list price.
+        if counter < current_price:
+            return ("Counteroffer", counter, round(margin(counter, total_cost, commission), 4))
 
     # Even the shallowest allowed discount can't clear the margin — decline.
     return ("Declined", 0.0, 0.0)
@@ -852,8 +999,11 @@ def respond_to_best_offer(token: str, item_id: str, best_offer_id: str, action: 
 def _offer_log_line(row, settings: dict) -> str:
     """One human-readable line describing the action taken on an offer.
 
-    Accepted / Counteroffer read straight from the decided row; Declined recomputes
-    the best-case margin (at the shallowest allowed discount) to show why it failed.
+    Accepted / Counteroffer read straight from the decided row; Declined recomputes the
+    best-case margin to show why it failed. That best case is the shallowest allowed
+    discount on a margin-priced account, but the full list price on a discount-cap
+    account, which never consults the discount band — quoting the band there would
+    explain the decline by a number that played no part in it.
     """
     item = row.item_number
     if row.action == "Accepted":
@@ -862,10 +1012,15 @@ def _offer_log_line(row, settings: dict) -> str:
     if row.action == "Counteroffer":
         return (f"Counteroffered for item {item} from ${row.cx_offer:,.2f} to ${row.counter:,.2f} "
                 f"with a profit of {row.counter_margin * 100:.2f}%.")
-    best_margin = margin(row.current_price * (1 - settings["min_discount"]), row.total_cost, settings["commission"])
+    if row.account in DISCOUNT_CAP_ACCOUNTS:
+        best_price, reason = row.current_price, "even at the full list price"
+    else:
+        best_price = row.current_price * (1 - settings["min_discount"])
+        reason = f"after the lowest discount {settings['min_discount'] * 100:.0f}% applied"
+    best_margin = margin(best_price, row.total_cost, settings["commission"])
     shape = "negative" if best_margin < 0 else "too low"
     return (f"Offer declined for item {item}. Margin was {shape} at {best_margin * 100:.2f}% "
-            f"after the lowest discount {settings['min_discount'] * 100:.0f}% applied.")
+            f"{reason}.")
 
 
 def respond_to_offers(results: pd.DataFrame, token: str, settings: dict, live: bool) -> dict:
@@ -1243,9 +1398,11 @@ def build_summary_email(results: pd.DataFrame, settings: dict, greeting_text: st
         f"Rules used: commission {settings['commission']:.1%}; minimum profit {settings['min_profit']:.1%} "
         f"(Slow {settings['slow_min_profit']:.1%}, Dead {settings['dead_min_profit']:.1%}, "
         f"enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%})"
-        f"{flat_floor_summary(settings, separator='; ')}; counter discount band "
-        f"{settings['min_discount']:.0%} to {settings['max_discount']:.0%}; shipping estimated "
-        "by item weight.</p>"
+        f"{flat_floor_summary(settings, separator='; ')}"
+        f"{discount_cap_summary(settings, separator='; ')}; counter discount band "
+        f"{settings['min_discount']:.0%} to {settings['max_discount']:.0%}"
+        f"{' (accounts priced by margin only)' if DISCOUNT_CAP_ACCOUNTS else ''}; "
+        "shipping estimated by item weight.</p>"
     )
     intro = (
         f"<p style='{font}'>{esc(greeting)},</p>"
@@ -1347,10 +1504,18 @@ def main() -> None:
         f"Settings loaded — commission {settings['commission']:.1%}, "
         f"min profit {settings['min_profit']:.1%} (Slow {settings['slow_min_profit']:.1%}, "
         f"Dead {settings['dead_min_profit']:.1%}, enable-selling-below-cost {settings['sell_below_cost_min_profit']:.1%})"
-        f"{flat_floor_summary(settings)}, "
-        f"discount band {settings['min_discount']:.0%}-{settings['max_discount']:.0%}, "
+        f"{flat_floor_summary(settings)}{discount_cap_summary(settings)}, "
+        f"discount band {settings['min_discount']:.0%}-{settings['max_discount']:.0%}"
+        f"{' (accounts priced by margin only)' if DISCOUNT_CAP_ACCOUNTS else ''}, "
         "shipping estimated by item weight."
     )
+
+    for account in DISCOUNT_CAP_ACCOUNTS:
+        if settings.get(discount_cap_key(account)) == 0:
+            log.warning(
+                f"{account} has a 0% maximum discount — every offer below the listing price "
+                "will be declined, and only full-price offers accepted."
+            )
 
     today = date.today().strftime("%Y-%m-%d")
 

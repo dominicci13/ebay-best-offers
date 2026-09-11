@@ -185,3 +185,13 @@ def test_log_line_decline_shows_best_case_margin_and_lowest_discount():
         "Offer declined for item 333. Margin was negative at -6.74% "
         "after the lowest discount 5% applied."
     )
+
+
+def test_log_line_decline_on_a_cap_account_does_not_quote_the_discount_band(monkeypatch):
+    # A cap account never consults the band, so the decline reason is the full list price:
+    # margin(100, 90, 0.12) = (100 - 90 - 12)/100 = -2.00%.
+    monkeypatch.setattr(script, "DISCOUNT_CAP_ACCOUNTS", {"Acct1": "acct1 maximum discount"})
+    assert script._offer_log_line(_row("333"), SETTINGS) == (
+        "Offer declined for item 333. Margin was negative at -2.00% "
+        "even at the full list price."
+    )

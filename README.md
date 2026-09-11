@@ -5,13 +5,14 @@ seller accounts and records a priced decision for each one. It reads the pricing
 rules from a staff-editable control workbook, reads each account's pending
 offers from the eBay API, enriches every SKU with its cost and aged status from SQL
 Server, reads the buyer's offer, decides Accept / Counteroffer / Decline against a
-profit-margin rule, answers each offer on eBay through the Trading API, and writes
+profit-margin rule (or, on the accounts configured for it, a maximum discount off the
+selling price), answers each offer on eBay through the Trading API, and writes
 the full result to a permanent SQL archive. It then refreshes a read-only report
 workbook and sends an end-of-day summary email.
 
 The design is **SQL-first**: Python computes every number and stores it in
 `eBay.dbo.BestOffers`; the workbook and the email are read-only presentation
-layers. The interesting work is the **margin decision rule**, the **eBay Trading
+layers. The interesting work is the **pricing decision rules**, the **eBay Trading
 API** that both reads every buyer offer (paging through all results, sidestepping
 eBay's bot challenge entirely) and sends each response, and the **idempotent,
 append-only archive** that never loses a day.
@@ -24,9 +25,10 @@ append-only archive** that never loses a day.
 ## Daily flow (17:30, every day)
 
 1. **Read settings** from the control workbook (commission, the minimum profit
-   floors, counteroffer discount band). If a value is missing or out of
-   range, the run stops and emails the business team exactly what to fix, so no
-   offer is ever priced on a bad number.
+   floors including one per flat-floor account, one maximum discount per
+   discount-cap account, and the counteroffer discount band). If a value is missing
+   or out of range, the run stops and emails the business team exactly what to fix,
+   so no offer is ever priced on a bad number.
 2. **Read every buyer offer** from the eBay Trading API (`GetBestOffers`, paging
    through all results) per account.
 3. **Read the offered listings** — one `GetItem` per distinct item the offers name,
@@ -70,7 +72,7 @@ flowchart LR
 ## Decision rule
 
 `decide_offer(cx_offer, current_price, site_cost, weight_oz, aged_status,
-sell_below_cost, settings, out_of_stock, account)`
+sell_below_cost, settings, out_of_stock, account, offer_code)`
 is a pure function from the offer's numbers to `(action, counter_price, margin)`.
 For each offer it tests, in order:
 
@@ -110,6 +112,39 @@ Each configured label becomes a **required** workbook value, so a missing cell s
 run like any other setting instead of quietly pricing at the default floor. Account names
 and their margins stay out of this public repo.
 
+The account key here (and in `discount_cap_accounts` below) is matched to the run's configured
+eBay profile names, trimmed and case-insensitive. A key that matches no profile is ignored with a
+warning in the log and that account keeps ordinary margin pricing, so a rule that can never fire is
+never reported to the business as applied.
+
+**Some accounts are priced off the selling price instead of by margin.** An account listed
+in `discount_cap_accounts` sets one maximum discount, and `decide_by_discount_cap` replaces
+steps 5 to 7 above for it: accept anything within that discount of the current selling
+price, otherwise counter at exactly that discount.
+
+```json
+"discount_cap_accounts": { "Account4": "Account4 maximum discount" }
+```
+
+The profit floor still applies underneath as a **backstop**, so the rule never sells at a
+loss: an offer inside the cap that would not clear the floor is countered rather than
+accepted, the counter is raised to break-even when the cap alone would not clear the floor
+(rounded **up** to the cent, so float noise cannot cost a whole cent above it), and anything that would put the
+counter at or above the list price is declined instead — eBay rejects a counteroffer that is
+not below the Buy It Now price. The workbook's min/max
+counteroffer discount band is **not** consulted for these accounts, because the counter is
+the cap itself rather than the deepest discount in a band. The two maps are independent: an
+account can use either rule, both, or neither.
+
+A maximum discount of **0%** is allowed and means "this account gives no discounts": only a
+full-price offer is accepted and everything below it is declined. The run logs a warning when
+it sees one, because it is also what a mistyped `0` looks like.
+
+The "never counter at or above the list price" guard applies to the margin-first path too, not
+just cap accounts — it is reachable there whenever the min counteroffer discount is 0%. The
+**round-up is deliberately cap-only**: raising it on the margin-first path would move live
+counter prices by up to a cent on accounts that did not ask for the change.
+
 ```text
 margin      = (price - total_cost - price * commission) / price
 total_cost  = site_cost + est_shipping(weight_oz)
@@ -136,7 +171,8 @@ the run exits non-zero only if no account was recorded at all.
 
 Business users edit `Best-Offers-Settings.xlsx`, read with pandas (no Excel COM):
 commission; the minimum profit floors (default, Slow, Dead, sell-below-cost, plus one
-per flat-floor account); and the min/max counteroffer discount. Shipping is estimated
+per flat-floor account); one maximum discount per discount-cap account; and the min/max
+counteroffer discount. Shipping is estimated
 from each item's weight, so it is not a workbook value. Nothing else business-tunable
 lives in code or environment variables. A missing or invalid value stops the run and
 sends a plain-language fix-it email.
