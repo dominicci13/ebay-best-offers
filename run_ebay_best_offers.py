@@ -6,9 +6,11 @@ Runs once a day at 17:30 local time. Each run:
    discount band) from the control workbook. If a setting is missing or invalid,
    the run stops and emails the business team what to fix, so no offer is ever
    sent using a wrong number.
-2. Reads every buyer offer from the eBay Trading API (GetBestOffers, across all
-   pages), reads each offered listing with GetItem (SKU, price, stock), and
+2. Reads every pending buyer offer from the eBay Trading API (GetBestOffers, across
+   all pages), reads each offered listing with GetItem (SKU, price, stock), and
    enriches from SQL (site cost, weight, aged status).              [Step 3]
+   GetBestOffers returns only offers still active at read time, so an offer already
+   answered by hand in Seller Hub is never seen here or recorded in the archive.
 3. Decides Accept / Counteroffer / Decline (or skips) per offer.    [Step 2]
    Accounts in DISCOUNT_CAP_ACCOUNTS are priced differently: accept anything within
    their maximum discount off the selling price, otherwise counter at exactly that
@@ -790,7 +792,7 @@ def build_get_best_offers_xml(token: str, page: int = 1) -> str:
         '<?xml version="1.0" encoding="utf-8"?>'
         '<GetBestOffersRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
         f"<RequesterCredentials><eBayAuthToken>{html.escape(token)}</eBayAuthToken></RequesterCredentials>"
-        "<BestOfferStatus>Active</BestOfferStatus>"
+        "<BestOfferStatus>Active</BestOfferStatus>"  # "All" returns nothing (probed 2026-07-30, 2026-09-14)
         "<DetailLevel>ReturnAll</DetailLevel>"
         f"<Pagination><EntriesPerPage>100</EntriesPerPage><PageNumber>{int(page)}</PageNumber></Pagination>"
         "</GetBestOffersRequest>"
@@ -1088,6 +1090,7 @@ def respond_to_offers(results: pd.DataFrame, token: str, settings: dict, live: b
 # Every offer becomes one archive row: the numbers we read, the cost we
 # enriched, the margins we computed, and the decision we reached. `BestOffers`
 # is a permanent history — we only ever add today's rows, never wipe past days.
+# It is a history of what this run decided, not of all offer activity: only offers still pending at 17:30 are read.
 
 RESULT_COLUMNS = [
     "report_date", "account", "title", "sku", "item_number",

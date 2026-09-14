@@ -13,9 +13,9 @@ workbook and sends an end-of-day summary email.
 The design is **SQL-first**: Python computes every number and stores it in
 `eBay.dbo.BestOffers`; the workbook and the email are read-only presentation
 layers. The interesting work is the **pricing decision rules**, the **eBay Trading
-API** that both reads every buyer offer (paging through all results, sidestepping
+API** that both reads every pending buyer offer (paging through all results, sidestepping
 eBay's bot challenge entirely) and sends each response, and the **idempotent,
-append-only archive** that never loses a day.
+append-only archive** that never loses a day it recorded.
 
 > **Status:** **live.** `ACT_ON_OFFERS=true` — the acting step (Accept / Counter /
 > Decline via the Trading API) answers real buyer offers (live since 2026-07-10).
@@ -29,8 +29,9 @@ append-only archive** that never loses a day.
    discount-cap account, and the counteroffer discount band). If a value is missing
    or out of range, the run stops and emails the business team exactly what to fix,
    so no offer is ever priced on a bad number.
-2. **Read every buyer offer** from the eBay Trading API (`GetBestOffers`, paging
-   through all results) per account.
+2. **Read every pending buyer offer** from the eBay Trading API (`GetBestOffers`,
+   paging through all results) per account. Only offers still active at read time are
+   returned, so one already answered by hand is never seen (see "The permanent archive").
 3. **Read the offered listings** — one `GetItem` per distinct item the offers name,
    giving SKU, price and available quantity. Only listings that carry an offer are
    read, so this is a few dozen calls rather than a whole-account sweep.
@@ -159,6 +160,18 @@ The est_shipping weight tiers are a pricing table in code (`SHIPPING_TIERS`).
 
 `eBay.dbo.BestOffers` is **append-only and never truncated** — every past day is
 kept. The report shows only today (its Power Query filters on `report_date`).
+
+**What it is not:** it records the offers still *pending* when the run reads them,
+which is not the same as every offer a listing received. `GetBestOffers` returns only
+active offers, so anything accepted, declined or countered by hand in Seller Hub
+earlier in the day never reaches this table — and requesting a non-`Active`
+`BestOfferStatus` returns nothing in practice (probed 2026-07-30 and again 2026-09-14),
+so there is no read-back to reconcile against. To ask what actually happened to a SKU,
+join this archive to the sales themselves (`GetItemTransactions` for one listing,
+`GetSellerTransactions` for an account); both reach back about 90 days. Those reads are
+ad hoc and read-only, and their buyer identity fields must never be persisted — the
+keyset's Marketplace Account Deletion exemption rests on it.
+
 Same-day reruns are idempotent per account: an account's not-yet-answered rows are
 replaced with the latest read, and an account whose offers were all answered is
 skipped. Accounts are independent: one that fails is skipped and the rest still run.
